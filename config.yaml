@@ -1,0 +1,29 @@
+agent:
+  max_reflexion_iter: 3
+
+llm:
+  provider: deepseek
+  planner_model: deepseek-chat
+  verifier_model: deepseek-chat
+  synthesizer_model: deepseek-chat
+  temperature: 0.0
+
+colpali:
+  model_name: vidore/colpali-v1.2
+  lora_path: null
+  device: cuda
+  dtype: bfloat16
+  index_dir: ./data/index
+  top_k: 5
+
+vlm:
+  provider: openai_compat
+  model: gpt-4o-mini
+  base_url: null
+  api_key_env: OPENAI_API_KEY
+
+ingestion:
+  pdf_dir: ./data/reports
+  pages_dir: ./data/pages
+  dpi: 150
+  image_format: png

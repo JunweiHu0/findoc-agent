@@ -1,0 +1,3 @@
+{"id": "L1-001", "level": "L1", "question": "贵州茅台 2023 年的营业收入是多少？", "answer": "1505.60 亿元", "evidence": [{"doc_id": "moutai_2023", "page_num": 5}]}
+{"id": "L2-001", "level": "L2", "question": "宁德时代 2023 年研发投入占营收的比例是多少？", "answer": "5.18%", "evidence": [{"doc_id": "catl_2023", "page_num": 23}]}
+{"id": "L3-001", "level": "L3", "question": "对比贵州茅台、宁德时代、比亚迪 2023 年的毛利率。", "answer": "茅台约 92%，宁德时代约 22%，比亚迪约 20%。", "evidence": [{"doc_id": "moutai_2023", "page_num": 6}, {"doc_id": "catl_2023", "page_num": 6}, {"doc_id": "byd_2023", "page_num": 6}]}

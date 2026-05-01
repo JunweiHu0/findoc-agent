@@ -1,0 +1,58 @@
+# ============================================================
+# FinDoc Agent — Python dependencies
+# Python: 3.10
+# CUDA:   12.1 (adjust torch index-url below if different)
+# ============================================================
+
+# --- Core: PyTorch ---
+# 注意：PyTorch 不放在这里安装，单独跑：
+#   pip install torch==2.3.1 --index-url https://download.pytorch.org/whl/cu121
+# 这样能确保和你的 CUDA 版本对齐。
+
+# --- Agent / LLM orchestration ---
+langgraph>=0.2.0
+langchain>=0.2.0
+langchain-core>=0.2.0
+langchain-openai>=0.1.0       # 如果走 OpenAI / 兼容 API
+langchain-community>=0.2.0
+
+# --- ColPali & multi-modal retrieval ---
+colpali-engine>=0.3.0          # 官方包，封装了 ColPali / ColQwen2
+transformers>=4.45.0
+accelerate>=0.30.0
+peft>=0.11.0                   # 加载你之前微调的 LoRA
+sentence-transformers>=3.0.0   # 备用文本 embedding（baseline 对比用）
+einops>=0.7.0
+
+# --- Vision Language Model (页面解读) ---
+# Qwen2.5-VL 通过 transformers 调用，无需额外包
+# 如需调 GPT-4o，已在 langchain-openai 中
+
+# --- PDF / 文档处理 ---
+pypdf>=4.0.0                   # 元信息、页数
+pdf2image>=1.17.0              # PDF 转图像（ColPali 输入）
+Pillow>=10.0.0
+# 注：pdf2image 需要系统层装 poppler，见下方 Step 3
+
+# --- Web 框架 ---
+fastapi>=0.110.0
+uvicorn[standard]>=0.27.0
+gradio>=4.40.0                 # demo 前端
+python-multipart>=0.0.9        # FastAPI 文件上传
+
+# --- 工具类 ---
+python-dotenv>=1.0.0           # 加载 .env
+pydantic>=2.6.0
+pyyaml>=6.0
+tqdm>=4.66.0
+loguru>=0.7.0                  # 比 print 优雅的日志
+
+# --- 评测 ---
+pandas>=2.2.0
+numpy>=1.26.0
+matplotlib>=3.8.0              # 评测结果可视化
+
+# --- 开发工具（可选但推荐） ---
+ipython>=8.20.0
+jupyter>=1.0.0
+ruff>=0.4.0                    # 比 black + flake8 更快的 linter/formatter
