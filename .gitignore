@@ -7,8 +7,10 @@ venv/
 *.bin
 *.safetensors
 checkpoints/
+models/
 data/
 .env
+DEVLOG.md
 .env.*
 !.env.example
 .vscode/

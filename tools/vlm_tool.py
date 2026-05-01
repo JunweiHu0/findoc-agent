@@ -1,15 +1,13 @@
 """Page-level VLM extraction tool.
 
-Sends a page image plus an instruction to an OpenAI-compatible vision endpoint
-(GPT-4o today; trivially swappable to any compatible VL endpoint by editing
-config.yaml's vlm.{model, base_url, api_key_env}).
+Sends a page image plus an instruction to an OpenAI-compatible vision endpoint.
+Default config points at Aliyun Dashscope's compatible-mode endpoint
+(`QWEN_BASE_URL`) using `QWEN_API_KEY`. Any other compatible endpoint can be
+swapped in by editing config.yaml's vlm.{model, base_url_env, api_key_env}.
 
 Falls back to a deterministic mock when:
-- the image file is missing (P1 skeleton),
-- the API key for the configured provider is empty.
-
-DeepSeek's public API is text-only, so the default config points at OpenAI's
-endpoint via OPENAI_API_KEY.
+- the image file is missing,
+- the configured api key env var is empty.
 """
 from __future__ import annotations
 
@@ -20,7 +18,7 @@ from typing import Optional
 
 from loguru import logger
 
-from agent.config import CONFIG, OPENAI_API_KEY, OPENAI_BASE_URL
+from agent.config import CONFIG
 
 
 _VLM_CFG = CONFIG["vlm"]
@@ -32,7 +30,9 @@ def vlm_read_page(image_path: str, instruction: str) -> str:
 
     api_key = _resolve_api_key()
     if not api_key:
-        logger.warning("VLM api key not set — returning mock extraction")
+        logger.warning(
+            f"VLM api key env '{_VLM_CFG['api_key_env']}' is empty — returning mock extraction"
+        )
         return f"[mock vlm] {Path(image_path).name} :: {instruction}"
 
     try:
@@ -43,14 +43,11 @@ def vlm_read_page(image_path: str, instruction: str) -> str:
 
 
 def _resolve_api_key() -> str:
-    env_name = _VLM_CFG.get("api_key_env", "OPENAI_API_KEY")
-    if env_name == "OPENAI_API_KEY":
-        return OPENAI_API_KEY
-    return os.getenv(env_name, "")
+    return os.getenv(_VLM_CFG["api_key_env"], "")
 
 
 def _resolve_base_url() -> Optional[str]:
-    return _VLM_CFG.get("base_url") or OPENAI_BASE_URL
+    return os.getenv(_VLM_CFG.get("base_url_env", ""), "") or None
 
 
 def _encode_image(image_path: str) -> str:
@@ -91,4 +88,4 @@ def _call_openai_compat(image_path: str, instruction: str, api_key: str) -> str:
 
 
 if __name__ == "__main__":
-    print(vlm_read_page("data/pages/moutai_2023/p042.png", "提取 2023 年毛利率"))
+    print(vlm_read_page("data/pages/moutai_2023/p001.png", "概述这页的主要内容"))

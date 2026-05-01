@@ -19,13 +19,15 @@ def _abs(rel: str) -> Path:
 
 DEEPSEEK_API_KEY = os.getenv("DEEPSEEK_API_KEY", "")
 DEEPSEEK_BASE_URL = os.getenv("DEEPSEEK_BASE_URL", "https://api.deepseek.com/v1")
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_BASE_URL = os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1")
+
+QWEN_API_KEY = os.getenv("QWEN_API_KEY", "")
+QWEN_BASE_URL = os.getenv("QWEN_BASE_URL", "https://dashscope.aliyuncs.com/compatible-mode/v1")
 
 PDF_DIR = _abs(CONFIG["ingestion"]["pdf_dir"])
 PAGES_DIR = _abs(CONFIG["ingestion"]["pages_dir"])
-INDEX_DIR = _abs(CONFIG["colpali"]["index_dir"])
+INDEX_DIR = _abs(CONFIG["retriever"]["index_dir"])
+MODELS_DIR = ROOT / "models"
 CHECKPOINTS_DIR = ROOT / "checkpoints"
 
 MAX_REFLEXION_ITER: int = CONFIG["agent"]["max_reflexion_iter"]
-TOP_K: int = CONFIG["colpali"]["top_k"]
+TOP_K: int = CONFIG["retriever"]["top_k"]

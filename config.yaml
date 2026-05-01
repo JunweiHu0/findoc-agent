@@ -3,27 +3,37 @@ agent:
 
 llm:
   provider: deepseek
-  planner_model: deepseek-chat
-  verifier_model: deepseek-chat
-  synthesizer_model: deepseek-chat
+  planner_model: deepseek-v4
+  verifier_model: deepseek-v4
+  synthesizer_model: deepseek-v4
   temperature: 0.0
 
-colpali:
-  model_name: vidore/colpali-v1.2
-  lora_path: null
+retriever:
+  backbone: colqwen2                         # colqwen2 | colpali (extension point)
+  model_name: ./models/colqwen2-v0.1         # adapter dir (LoRA on colqwen2-base)
+  base_model_name: ./models/colqwen2-base    # transformer base, referenced by adapter_config.json
+  lora_path: null                            # user's domain-FT LoRA, plugged in once available
   device: cuda
   dtype: bfloat16
   index_dir: ./data/index
   top_k: 5
+  encode_batch_size: 1
 
 vlm:
-  provider: openai_compat
-  model: gpt-4o-mini
-  base_url: null
-  api_key_env: OPENAI_API_KEY
+  provider: qwen
+  model: qwen3.6-plus
+  base_url_env: QWEN_BASE_URL
+  api_key_env: QWEN_API_KEY
 
 ingestion:
   pdf_dir: ./data/reports
   pages_dir: ./data/pages
   dpi: 150
   image_format: png
+  doc_id_aliases:
+    "贵州茅台": moutai
+    "宁德时代": catl
+    "招商银行": cmb
+    "恒瑞医药": hengrui
+    "万科A": vanke
+    "万科Ａ": vanke
