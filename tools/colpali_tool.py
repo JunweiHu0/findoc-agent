@@ -27,9 +27,9 @@ from agent.state import PageHit
 
 
 _MOCK_HITS = [
-    PageHit(doc_id="moutai_2023", page_num=42, score=0.91, image_path="data/pages/moutai_2023/p042.png"),
-    PageHit(doc_id="moutai_2023", page_num=43, score=0.84, image_path="data/pages/moutai_2023/p043.png"),
-    PageHit(doc_id="catl_2023", page_num=58, score=0.79, image_path="data/pages/catl_2023/p058.png"),
+    PageHit(doc_id="moutai_2023", page_num=1, score=0.91, image_path="data/pages/moutai_2023/p001.png"),
+    PageHit(doc_id="moutai_2023", page_num=2, score=0.84, image_path="data/pages/moutai_2023/p002.png"),
+    PageHit(doc_id="moutai_2023", page_num=3, score=0.79, image_path="data/pages/moutai_2023/p003.png"),
 ]
 
 

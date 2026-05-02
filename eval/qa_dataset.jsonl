@@ -1,3 +1,30 @@
-{"id": "L1-001", "level": "L1", "question": "贵州茅台 2023 年的营业收入是多少？", "answer": "1505.60 亿元", "evidence": [{"doc_id": "moutai_2023", "page_num": 5}]}
-{"id": "L2-001", "level": "L2", "question": "宁德时代 2023 年研发投入占营收的比例是多少？", "answer": "5.18%", "evidence": [{"doc_id": "catl_2023", "page_num": 23}]}
-{"id": "L3-001", "level": "L3", "question": "对比贵州茅台、宁德时代、比亚迪 2023 年的毛利率。", "answer": "茅台约 92%，宁德时代约 22%，比亚迪约 20%。", "evidence": [{"doc_id": "moutai_2023", "page_num": 6}, {"doc_id": "catl_2023", "page_num": 6}, {"doc_id": "byd_2023", "page_num": 6}]}
+{"id": "L1-001", "level": "L1", "question": "贵州茅台 2023 年的营业收入是多少？", "answer": "约 1505.60 亿元", "evidence": [{"doc_id": "moutai_2023", "page_num": 0}]}
+{"id": "L1-002", "level": "L1", "question": "贵州茅台 2024 年的归属于上市公司股东的净利润是多少？", "answer": "约 862.28 亿元", "evidence": [{"doc_id": "moutai_2024", "page_num": 0}]}
+{"id": "L1-003", "level": "L1", "question": "宁德时代 2023 年的营业收入是多少？", "answer": "约 4009.17 亿元", "evidence": [{"doc_id": "catl_2023", "page_num": 0}]}
+{"id": "L1-004", "level": "L1", "question": "宁德时代 2024 年的归母净利润是多少？", "answer": "约 507.45 亿元", "evidence": [{"doc_id": "catl_2024", "page_num": 0}]}
+{"id": "L1-005", "level": "L1", "question": "招商银行 2023 年末的资产总额是多少？", "answer": "约 11.03 万亿元", "evidence": [{"doc_id": "cmb_2023", "page_num": 0}]}
+{"id": "L1-006", "level": "L1", "question": "招商银行 2024 年末员工总数是多少？", "answer": "约 11.6 万人", "evidence": [{"doc_id": "cmb_2024", "page_num": 0}]}
+{"id": "L1-007", "level": "L1", "question": "恒瑞医药 2023 年的营业收入是多少？", "answer": "约 228.20 亿元", "evidence": [{"doc_id": "hengrui_2023", "page_num": 0}]}
+{"id": "L1-008", "level": "L1", "question": "恒瑞医药 2024 年的研发投入金额是多少？", "answer": "约 82.28 亿元", "evidence": [{"doc_id": "hengrui_2024", "page_num": 0}]}
+{"id": "L1-009", "level": "L1", "question": "万科 A 2024 年的营业收入是多少？", "answer": "约 3431.76 亿元", "evidence": [{"doc_id": "vanke_2024", "page_num": 0}]}
+{"id": "L1-010", "level": "L1", "question": "万科 A 2023 年末的总资产是多少？", "answer": "约 1.50 万亿元", "evidence": [{"doc_id": "vanke_2023", "page_num": 0}]}
+{"id": "L2-001", "level": "L2", "question": "宁德时代 2023 年研发投入占营业收入的比例是多少？", "answer": "约 5.18%", "evidence": [{"doc_id": "catl_2023", "page_num": 0}]}
+{"id": "L2-002", "level": "L2", "question": "贵州茅台 2023 年的毛利率约为多少？", "answer": "约 91.96%", "evidence": [{"doc_id": "moutai_2023", "page_num": 0}]}
+{"id": "L2-003", "level": "L2", "question": "恒瑞医药 2024 年研发投入占营业收入的比例是多少？", "answer": "约 29.71%", "evidence": [{"doc_id": "hengrui_2024", "page_num": 0}]}
+{"id": "L2-004", "level": "L2", "question": "招商银行 2024 年的净息差（NIM）是多少？", "answer": "约 1.98%", "evidence": [{"doc_id": "cmb_2024", "page_num": 0}]}
+{"id": "L2-005", "level": "L2", "question": "万科 A 2024 年的资产负债率约为多少？", "answer": "约 73.7%", "evidence": [{"doc_id": "vanke_2024", "page_num": 0}]}
+{"id": "L2-006", "level": "L2", "question": "贵州茅台 2024 年的销售费用率约为多少？", "answer": "约 3.4%", "evidence": [{"doc_id": "moutai_2024", "page_num": 0}]}
+{"id": "L2-007", "level": "L2", "question": "宁德时代 2024 年的归母净利润同比增长率是多少？", "answer": "约 15.0%", "evidence": [{"doc_id": "catl_2024", "page_num": 0}, {"doc_id": "catl_2023", "page_num": 0}]}
+{"id": "L2-008", "level": "L2", "question": "招商银行 2024 年不良贷款率是多少？", "answer": "约 0.95%", "evidence": [{"doc_id": "cmb_2024", "page_num": 0}]}
+{"id": "L2-009", "level": "L2", "question": "恒瑞医药 2023 年的销售费用占营业收入的比例约为多少？", "answer": "约 33%", "evidence": [{"doc_id": "hengrui_2023", "page_num": 0}]}
+{"id": "L2-010", "level": "L2", "question": "万科 A 2023 年合同销售金额（合同销售额）是多少？", "answer": "约 3761 亿元", "evidence": [{"doc_id": "vanke_2023", "page_num": 0}]}
+{"id": "L3-001", "level": "L3", "question": "对比贵州茅台、宁德时代 2023 年的毛利率。", "answer": "茅台约 91.96%，宁德时代约 22.91%；茅台远高于宁德时代。", "evidence": [{"doc_id": "moutai_2023", "page_num": 0}, {"doc_id": "catl_2023", "page_num": 0}]}
+{"id": "L3-002", "level": "L3", "question": "贵州茅台 2022、2023、2024 三年营业收入的同比增速分别是多少？", "answer": "2023 同比约 18.0%，2024 同比约 15.7%；增速放缓。", "evidence": [{"doc_id": "moutai_2022", "page_num": 0}, {"doc_id": "moutai_2023", "page_num": 0}, {"doc_id": "moutai_2024", "page_num": 0}]}
+{"id": "L3-003", "level": "L3", "question": "对比恒瑞医药 2022 年与 2024 年研发投入占营业收入的比例变化。", "answer": "2022 年约 29.8%，2024 年约 29.7%，基本持平。", "evidence": [{"doc_id": "hengrui_2022", "page_num": 0}, {"doc_id": "hengrui_2024", "page_num": 0}]}
+{"id": "L3-004", "level": "L3", "question": "招商银行 2022—2024 年的不良贷款率走势如何？", "answer": "2022 年约 0.96%，2023 年约 0.95%，2024 年约 0.95%；保持稳定。", "evidence": [{"doc_id": "cmb_2022", "page_num": 0}, {"doc_id": "cmb_2023", "page_num": 0}, {"doc_id": "cmb_2024", "page_num": 0}]}
+{"id": "L3-005", "level": "L3", "question": "对比宁德时代 2023、2024、2025 三年营业收入。", "answer": "2023 约 4009 亿元，2024 约 3620 亿元，2025 约 4180 亿元；先降后升。", "evidence": [{"doc_id": "catl_2023", "page_num": 0}, {"doc_id": "catl_2024", "page_num": 0}, {"doc_id": "catl_2025", "page_num": 0}]}
+{"id": "L3-006", "level": "L3", "question": "对比万科 A 2023 年与 2024 年的合同销售金额变化。", "answer": "2023 约 3761 亿元，2024 约 2460 亿元；同比下滑约 35%。", "evidence": [{"doc_id": "vanke_2023", "page_num": 0}, {"doc_id": "vanke_2024", "page_num": 0}]}
+{"id": "L3-007", "level": "L3", "question": "对比 2023 年贵州茅台与恒瑞医药的净利率水平。", "answer": "茅台净利率约 52%，恒瑞约 18%；茅台显著更高。", "evidence": [{"doc_id": "moutai_2023", "page_num": 0}, {"doc_id": "hengrui_2023", "page_num": 0}]}
+{"id": "L3-008", "level": "L3", "question": "对比招商银行 2023、2024 年的归母净利润同比增速。", "answer": "2023 约 +6.2%，2024 约 +1.2%；增速放缓。", "evidence": [{"doc_id": "cmb_2023", "page_num": 0}, {"doc_id": "cmb_2024", "page_num": 0}]}
+{"id": "L3-009", "level": "L3", "question": "对比贵州茅台 2023 年与 2024 年的归母净利润同比增速。", "answer": "2023 同比约 +19%，2024 同比约 +15%；保持双位数增长但放缓。", "evidence": [{"doc_id": "moutai_2023", "page_num": 0}, {"doc_id": "moutai_2024", "page_num": 0}]}
+{"id": "L3-010", "level": "L3", "question": "对比宁德时代 2024 年与万科 A 2024 年的资产负债率。", "answer": "宁德时代约 65%，万科 A 约 74%；万科更高。", "evidence": [{"doc_id": "catl_2024", "page_num": 0}, {"doc_id": "vanke_2024", "page_num": 0}]}

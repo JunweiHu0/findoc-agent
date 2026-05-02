@@ -3,9 +3,9 @@ agent:
 
 llm:
   provider: deepseek
-  planner_model: deepseek-v4
-  verifier_model: deepseek-v4
-  synthesizer_model: deepseek-v4
+  planner_model: deepseek-v4-flash
+  verifier_model: deepseek-v4-flash
+  synthesizer_model: deepseek-v4-flash
   temperature: 0.0
 
 retriever:

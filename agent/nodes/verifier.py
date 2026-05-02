@@ -21,7 +21,7 @@ def verifier_node(state: AgentState) -> dict:
         return _heuristic(plan, cursor, iter_count)
 
     try:
-        llm = get_llm("verifier").with_structured_output(VerifierOutput)
+        llm = get_llm("verifier").with_structured_output(VerifierOutput, method="json_mode")
         prompt = _PROMPT.format(
             query=state["query"],
             plan=_render_plan(plan),

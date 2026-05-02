@@ -22,4 +22,13 @@ Return ONLY valid JSON of the form:
 Rules:
 - Keep the plan minimal. Do not invent sub-tasks the question does not require.
 - If the question is a single-fact lookup, return a single-element plan.
-- If a sub-task requires arithmetic on retrieved numbers, mark expected_output_schema as "number" and put the formula in sub_query.
+- target_doc MUST be one of the doc_id values listed above, or null. Never invent a doc_id.
+
+Schema discipline (strict):
+- "text"   → retrieval + page reading. sub_query is a natural-language question. USE THIS for every fact lookup, including when a percentage or ratio appears verbatim on a page.
+- "table"  → same as "text" but expecting a tabular extraction.
+- "number" → ARITHMETIC ONLY. sub_query MUST be a pure arithmetic expression composed of numeric literals and + - * / ( ) ** //, e.g. "(1500.5 - 800.2) / 1500.5 * 100". A "number" sub_task NEVER contains Chinese characters, punctuation like "？", or words; it is what `eval()` would accept. If the value cannot be obtained without first reading pages, do NOT use "number" — emit a "text" sub_task whose sub_query asks for the figure.
+
+Two-stage pattern for derived metrics (毛利率 / 同比 / 占比 etc.):
+1. Emit one or more "text" sub_tasks to retrieve the raw numbers (e.g. 营业收入、营业成本) from the relevant doc.
+2. Then optionally emit a "number" sub_task whose sub_query is the arithmetic expression with the literal numbers substituted in. If you cannot fill in the numbers in the planning stage, omit the "number" step — the executor will not run a malformed expression.
