@@ -1,0 +1,57 @@
+# Chainlit configuration for FinDoc Agent
+# Docs: https://docs.chainlit.io/backend/config/overview
+
+[project]
+enable_telemetry = false
+# 单 session 30 分钟空闲超时（金融问答 trace 较长，给宽一点）
+session_timeout = 1800
+# 用户停留同一会话期间，agent 状态全部内存保留
+user_env = []
+# 允许并发 session（多用户演示）
+allow_origins = ["*"]
+
+[features]
+# Step 折叠、复制按钮等保留默认
+prompt_playground = true
+unsafe_allow_html = false
+latex = false
+auto_tag_thread = true
+
+[features.spontaneous_file_upload]
+# 当前架构不支持运行时上传（文档需要离线 build_index）
+enabled = false
+
+[UI]
+name = "FinDoc Agent"
+description = "金融年报多模态 RAG · ColQwen2 视觉检索 + LangGraph 反思循环"
+default_collapse_content = true
+hide_cot = false
+github = "https://github.com/JunweiHu0/findoc-agent"
+custom_css = "/public/stylesheet.css"
+
+[UI.theme]
+default = "light"
+layout = "wide"
+font_family = "'Inter', system-ui, -apple-system, 'PingFang SC', 'Microsoft YaHei', sans-serif"
+
+# Amber 配色——和 Gradio 版本保持视觉一致
+[UI.theme.light]
+background = "#ffffff"
+paper = "#fffbeb"
+
+[UI.theme.light.primary]
+main = "#d97706"
+dark = "#b45309"
+light = "#fef3c7"
+
+[UI.theme.dark]
+background = "#1c1917"
+paper = "#292524"
+
+[UI.theme.dark.primary]
+main = "#f59e0b"
+dark = "#d97706"
+light = "#fbbf24"
+
+[meta]
+generated_by = "findoc-agent / chainlit"

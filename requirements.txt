@@ -38,7 +38,8 @@ Pillow>=10.0.0
 # --- Web 框架 ---
 fastapi>=0.110.0
 uvicorn[standard]>=0.27.0
-gradio>=4.40.0                 # demo 前端
+gradio>=4.40.0                 # demo 前端 (v1，保留作 fallback)
+chainlit>=2.0,<3.0             # demo 前端 (v2，LangGraph 原生)
 python-multipart>=0.0.9        # FastAPI 文件上传
 
 # --- 工具类 ---

@@ -1,0 +1,84 @@
+/* FinDoc Agent · Chainlit custom polish
+ * 与 Gradio 版本的 amber 视觉保持一致：主色 #d97706, soft #fef3c7, tint #fffbeb
+ * 仅覆盖 Chainlit 默认 token 控制不到的细节，保留官方主题骨架。
+ */
+
+:root {
+  --findoc-accent: #d97706;
+  --findoc-accent-hover: #b45309;
+  --findoc-accent-soft: #fef3c7;
+  --findoc-accent-tint: #fffbeb;
+  --findoc-warm-border: #fde68a;
+  --findoc-ink: #292524;
+  --findoc-ink-soft: #57534e;
+}
+
+/* 用户气泡：暖色渐变 + amber 边 */
+.message[data-step-type="user_message"] .message-content,
+[data-test="user-message"] .message-content {
+  background: linear-gradient(135deg, var(--findoc-accent-soft), #fde68a) !important;
+  border: 1px solid var(--findoc-warm-border) !important;
+  color: var(--findoc-ink) !important;
+}
+
+/* 助手气泡：白底 + 浅边 + 微阴影 */
+.message[data-step-type="assistant_message"] .message-content {
+  background: #ffffff !important;
+  border: 1px solid #e7e5e4 !important;
+  box-shadow: 0 1px 2px rgba(120, 113, 108, 0.08) !important;
+}
+
+/* Step 折叠面板：左侧 amber 强调条 */
+.step {
+  border-left: 3px solid var(--findoc-accent) !important;
+  padding-left: 12px !important;
+  background: var(--findoc-accent-tint) !important;
+  border-radius: 6px !important;
+  margin: 4px 0 !important;
+}
+
+.step .step-name {
+  color: var(--findoc-accent-hover) !important;
+  font-weight: 600 !important;
+}
+
+/* Starter 卡片：暖色 hover */
+[data-test="starter"]:hover {
+  border-color: var(--findoc-accent) !important;
+  background: var(--findoc-accent-tint) !important;
+}
+
+/* 引用图缩略图：圆角 + 边框 */
+.message-image,
+[data-test="message-image"] img {
+  border-radius: 8px !important;
+  border: 1px solid var(--findoc-warm-border) !important;
+  max-width: 240px !important;
+}
+
+/* 顶部栏：白→amber 渐变收尾 */
+header,
+.cl-header {
+  background: linear-gradient(90deg, #ffffff 0%, var(--findoc-accent-tint) 70%, var(--findoc-accent-soft) 100%) !important;
+  border-bottom: 1px solid #e7e5e4 !important;
+}
+
+/* 主 CTA 按钮 */
+button[data-test="send-button"],
+button.MuiButton-containedPrimary {
+  background-color: var(--findoc-accent) !important;
+}
+
+button[data-test="send-button"]:hover,
+button.MuiButton-containedPrimary:hover {
+  background-color: var(--findoc-accent-hover) !important;
+}
+
+/* 行内引用 code（[doc_id p.X]）：暖色高亮 */
+.message-content code {
+  background: var(--findoc-accent-soft) !important;
+  color: var(--findoc-accent-hover) !important;
+  padding: 1px 6px !important;
+  border-radius: 4px !important;
+  font-size: 0.9em !important;
+}
