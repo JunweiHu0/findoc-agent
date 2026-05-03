@@ -20,67 +20,29 @@ from pathlib import Path
 from typing import Optional
 
 import torch
-from PIL import Image
 from loguru import logger
 from tqdm import tqdm
 
 from agent.config import CONFIG, INDEX_DIR, PAGES_DIR
+from ingestion.model_loader import encode_pages, load_model_and_processor
 
 
-def _resolve_path(maybe_relative: str) -> str:
-    p = Path(maybe_relative)
-    if p.is_absolute() or not (Path.cwd() / p).exists():
-        return str(p)
-    return str((Path.cwd() / p).resolve())
+def _encode_pages_remote(image_paths: list[Path], colqwen_url: str, batch_size: int) -> "torch.Tensor":
+    """Encode pages via ColQwen Service HTTP endpoint."""
+    import httpx
 
-
-def _load_model_and_processor(lora_path: Optional[str]):
-    cfg = CONFIG["retriever"]
-    backbone = cfg.get("backbone", "colqwen2")
-    dtype = getattr(torch, cfg["dtype"])
-    model_name = _resolve_path(cfg["model_name"])
-
-    if backbone == "colqwen2":
-        from colpali_engine.models import ColQwen2, ColQwen2Processor
-        ModelCls, ProcessorCls = ColQwen2, ColQwen2Processor
-    elif backbone == "colpali":
-        from colpali_engine.models import ColPali, ColPaliProcessor
-        ModelCls, ProcessorCls = ColPali, ColPaliProcessor
-    else:
-        raise ValueError(f"unknown retriever.backbone: {backbone}")
-
-    logger.info(f"Loading {backbone} from {model_name} dtype={cfg['dtype']} device={cfg['device']}")
-    model = ModelCls.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=cfg["device"],
-    ).eval()
-
-    if lora_path and Path(lora_path).exists():
-        from peft import PeftModel
-        logger.info(f"Loading domain LoRA adapter from {lora_path}")
-        model = PeftModel.from_pretrained(model, lora_path)
-        model = model.merge_and_unload()
-    elif lora_path:
-        logger.warning(f"LoRA path {lora_path} does not exist; using base retriever only")
-
-    processor = ProcessorCls.from_pretrained(model_name)
-    return model, processor
-
-
-def _encode_pages(model, processor, image_paths: list[Path], batch_size: int) -> torch.Tensor:
     chunks: list[torch.Tensor] = []
-    for i in tqdm(range(0, len(image_paths), batch_size), desc="encoding"):
-        batch_paths = image_paths[i : i + batch_size]
-        images = [Image.open(p).convert("RGB") for p in batch_paths]
-        batch = processor.process_images(images).to(model.device)
-        with torch.no_grad():
-            emb = model(**batch)
-        chunks.append(emb.to("cpu", dtype=torch.float16))
-        for img in images:
-            img.close()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+    for i in tqdm(range(0, len(image_paths), batch_size), desc="encoding (remote)"):
+        batch = [str(p) for p in image_paths[i : i + batch_size]]
+        resp = httpx.post(
+            f"{colqwen_url}/predict",
+            json={"action": "encode_pages", "image_paths": batch},
+            timeout=600.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        chunks.append(torch.tensor(data["embeddings"], dtype=torch.float16))
+
     max_tokens = max(c.shape[1] for c in chunks)
     if any(c.shape[1] != max_tokens for c in chunks):
         padded = []
@@ -93,7 +55,7 @@ def _encode_pages(model, processor, image_paths: list[Path], batch_size: int) ->
     return torch.cat(chunks, dim=0)
 
 
-def index_doc(model, processor, doc_pages_dir: Path, doc_index_dir: Path, batch_size: int) -> int:
+def index_doc(model, processor, doc_pages_dir: Path, doc_index_dir: Path, batch_size: int, colqwen_url: str = "") -> int:
     image_paths = sorted(doc_pages_dir.glob("p*.png"))
     if not image_paths:
         logger.warning(f"no pages in {doc_pages_dir}, skipping")
@@ -106,7 +68,10 @@ def index_doc(model, processor, doc_pages_dir: Path, doc_index_dir: Path, batch_
         return 0
 
     doc_index_dir.mkdir(parents=True, exist_ok=True)
-    embeddings = _encode_pages(model, processor, image_paths, batch_size)
+    if colqwen_url:
+        embeddings = _encode_pages_remote(image_paths, colqwen_url, batch_size)
+    else:
+        embeddings = encode_pages(model, processor, image_paths, batch_size)
     page_nums = [int(p.stem.lstrip("p")) for p in image_paths]
 
     torch.save({"embeddings": embeddings, "page_nums": page_nums}, pt_path)
@@ -148,6 +113,8 @@ def main() -> None:
     parser.add_argument("--lora_path", type=str, default=CONFIG["retriever"].get("lora_path"))
     parser.add_argument("--batch_size", type=int, default=CONFIG["retriever"].get("encode_batch_size", 1))
     parser.add_argument("--only", type=str, default=None, help="substring filter on doc_id")
+    parser.add_argument("--colqwen_url", type=str, default=CONFIG.get("services", {}).get("colqwen_url", ""),
+                        help="remote ColQwen Service URL (if set, skip local model load)")
     args = parser.parse_args()
 
     doc_dirs = sorted([d for d in args.pages_dir.iterdir() if d.is_dir()])
@@ -157,10 +124,16 @@ def main() -> None:
         logger.error(f"no doc page directories found under {args.pages_dir}")
         return
 
-    model, processor = _load_model_and_processor(args.lora_path)
+    if args.colqwen_url:
+        logger.info(f"Using remote ColQwen Service at {args.colqwen_url}")
+        model, processor = None, None
+    else:
+        model, processor = load_model_and_processor(args.lora_path)
+
     total = 0
     for doc_dir in doc_dirs:
-        total += index_doc(model, processor, doc_dir, args.index_dir / doc_dir.name, args.batch_size)
+        total += index_doc(model, processor, doc_dir, args.index_dir / doc_dir.name, args.batch_size,
+                           colqwen_url=args.colqwen_url)
     build_doc_memory(args.index_dir, args.pages_dir)
     logger.info(f"Done. Indexed {total} new pages across {len(doc_dirs)} docs.")
 

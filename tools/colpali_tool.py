@@ -24,6 +24,8 @@ from loguru import logger
 
 from agent.config import CONFIG, INDEX_DIR
 from agent.state import PageHit
+from ingestion.model_loader import encode_query as _local_encode_query
+from ingestion.model_loader import load_model_and_processor as _load_model
 
 
 _MOCK_HITS = [
@@ -57,40 +59,13 @@ def _load_indexes() -> dict[str, dict]:
     return indexes
 
 
-def _resolve_path(maybe_relative: str) -> str:
-    p = Path(maybe_relative)
-    if p.is_absolute() or not (Path.cwd() / p).exists():
-        return str(p)
-    return str((Path.cwd() / p).resolve())
-
-
-def _load_model_and_processor():
-    cfg = CONFIG["retriever"]
-    backbone = cfg.get("backbone", "colqwen2")
-    dtype = getattr(torch, cfg["dtype"])
-    model_name = _resolve_path(cfg["model_name"])
-
-    if backbone == "colqwen2":
-        from colpali_engine.models import ColQwen2, ColQwen2Processor
-        ModelCls, ProcessorCls = ColQwen2, ColQwen2Processor
-    elif backbone == "colpali":
-        from colpali_engine.models import ColPali, ColPaliProcessor
-        ModelCls, ProcessorCls = ColPali, ColPaliProcessor
-    else:
-        raise ValueError(f"unknown retriever.backbone: {backbone}")
-
-    logger.info(f"Loading {backbone} retriever from {model_name} for query encoding")
-    model = ModelCls.from_pretrained(
-        model_name,
-        torch_dtype=dtype,
-        device_map=cfg["device"],
-    ).eval()
-    lora_path = cfg.get("lora_path")
-    if lora_path and Path(lora_path).exists():
-        from peft import PeftModel
-        model = PeftModel.from_pretrained(model, lora_path).merge_and_unload()
-    processor = ProcessorCls.from_pretrained(model_name)
-    return model, processor
+def _ensure_model_loaded() -> None:
+    """Lazy-load local model when remote service is not configured."""
+    if _state["model"] is not None:
+        return
+    model, processor = _load_model()
+    _state["model"] = model
+    _state["processor"] = processor
 
 
 def _ensure_loaded() -> bool:
@@ -100,20 +75,37 @@ def _ensure_loaded() -> bool:
     if not indexes:
         _state["indexes"] = {}
         return False
-    model, processor = _load_model_and_processor()
-    _state["model"] = model
-    _state["processor"] = processor
     _state["indexes"] = indexes
+    _ensure_model_loaded()
     return True
 
 
+def _encode_query_remote(query: str) -> "torch.Tensor | None":
+    """Encode query via ColQwen Service. Returns None on failure."""
+    import httpx
+    url = CONFIG.get("services", {}).get("colqwen_url", "")
+    if not url:
+        return None
+    try:
+        resp = httpx.post(
+            f"{url}/predict",
+            json={"action": "encode_query", "query": query},
+            timeout=30.0,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        return torch.tensor(data["embedding"], dtype=torch.float16)
+    except Exception as e:
+        logger.warning(f"remote encoding failed ({e}), falling back to local")
+        return None
+
+
 def _encode_query(query: str) -> torch.Tensor:
-    processor = _state["processor"]
-    model = _state["model"]
-    batch = processor.process_queries([query]).to(model.device)
-    with torch.no_grad():
-        emb = model(**batch)
-    return emb.to("cpu", dtype=torch.float16)[0]
+    emb = _encode_query_remote(query)
+    if emb is not None:
+        return emb
+    _ensure_model_loaded()
+    return _local_encode_query(_state["model"], _state["processor"], query)
 
 
 def _maxsim(query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
@@ -124,10 +116,10 @@ def _maxsim(query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
     return sim.max(dim=-1).values.sum(dim=-1)
 
 
-def colpali_retrieve(
+def _in_memory_retrieve(
     query: str,
-    top_k: int = 5,
-    doc_filter: Optional[list[str]] = None,
+    top_k: int,
+    doc_filter: Optional[list[str]],
 ) -> list[PageHit]:
     if not _ensure_loaded():
         logger.warning(f"no retriever index found under {INDEX_DIR} — returning mock hits")
@@ -162,6 +154,68 @@ def colpali_retrieve(
 
     all_hits.sort(key=lambda h: h.score, reverse=True)
     return all_hits[:top_k]
+
+
+def _qdrant_retrieve(
+    query: str,
+    top_k: int,
+    doc_filter: Optional[list[str]],
+) -> list[PageHit]:
+    from qdrant_client import QdrantClient
+    from qdrant_client.models import FieldCondition, Filter, MatchAny, MatchValue
+
+    qdrant_cfg = CONFIG["retriever"].get("qdrant", {})
+    client = QdrantClient(url=qdrant_cfg.get("url", "http://localhost:6333"))
+    collection = qdrant_cfg.get("collection_name", "findoc_pages")
+
+    q_emb = _encode_query(query)
+    query_vector = q_emb.numpy().tolist()
+
+    query_filter = None
+    if doc_filter:
+        if len(doc_filter) == 1:
+            query_filter = Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_filter[0]))]
+            )
+        else:
+            query_filter = Filter(
+                must=[FieldCondition(key="doc_id", match=MatchAny(any=doc_filter))]
+            )
+
+    results = client.query_points(
+        collection_name=collection,
+        query=query_vector,
+        query_filter=query_filter,
+        limit=top_k,
+        with_payload=True,
+    )
+
+    hits: list[PageHit] = []
+    for scored in results.points:
+        payload = scored.payload or {}
+        hits.append(PageHit(
+            doc_id=payload.get("doc_id", ""),
+            page_num=int(payload.get("page_num", 0)),
+            score=scored.score,
+            image_path=payload.get("image_path"),
+        ))
+    return hits
+
+
+def colpali_retrieve(
+    query: str,
+    top_k: int = 5,
+    doc_filter: Optional[list[str]] = None,
+) -> list[PageHit]:
+    backend = CONFIG["retriever"].get("backend", "in_memory")
+
+    if backend == "qdrant":
+        try:
+            return _qdrant_retrieve(query, top_k, doc_filter)
+        except Exception as e:
+            logger.error(f"Qdrant retrieval failed ({e}), falling back to in_memory")
+
+    return _in_memory_retrieve(query, top_k, doc_filter)
 
 
 if __name__ == "__main__":

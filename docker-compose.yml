@@ -1,0 +1,27 @@
+# FinDoc Agent — Docker Compose for Qdrant multi-vector storage (P8)
+#
+# Start:  docker compose up -d qdrant
+# Stop:   docker compose down
+#
+# The ColQwen Service container is commented out by default because it
+# requires NVIDIA Container Toolkit + GPU Docker runtime. Run the server
+# directly on the host instead:
+#   python -m services.colqwen_server --port 8000
+
+services:
+  qdrant:
+    image: qdrant/qdrant:v1.13.0
+    container_name: findoc-qdrant
+    ports:
+      - "6333:6333"    # REST API
+      - "6334:6334"    # gRPC
+    volumes:
+      - ./data/qdrant_storage:/qdrant/storage
+    environment:
+      - QDRANT__LOG_LEVEL=INFO
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:6333/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3

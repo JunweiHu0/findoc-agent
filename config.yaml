@@ -19,6 +19,14 @@ retriever:
   top_k: 5
   encode_batch_size: 1
 
+  # --- Backend selector ---
+  backend: in_memory                         # "in_memory" | "qdrant"
+
+  # --- Qdrant multi-vector storage (used when backend == "qdrant") ---
+  qdrant:
+    url: http://localhost:6333
+    collection_name: findoc_pages
+
 vlm:
   provider: qwen
   model: qwen3.6-plus
@@ -37,3 +45,7 @@ ingestion:
     "恒瑞医药": hengrui
     "万科A": vanke
     "万科Ａ": vanke
+
+# --- External services ---
+services:
+  colqwen_url: ""                            # "http://localhost:8000" when ColQwen Service is up; empty = local model
