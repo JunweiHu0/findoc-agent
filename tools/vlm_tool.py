@@ -23,6 +23,22 @@ from agent.config import CONFIG
 
 _VLM_CFG = CONFIG["vlm"]
 
+# Progress hook — set by the backend to send SSE progress events.
+_progress_hook: "callable | None" = None
+
+
+def set_progress_hook(hook: "callable | None") -> None:
+    global _progress_hook
+    _progress_hook = hook
+
+
+def _report_progress(msg: str) -> None:
+    if _progress_hook:
+        try:
+            _progress_hook(msg)
+        except Exception:
+            pass
+
 
 def vlm_read_page(image_path: str, instruction: str) -> str:
     if not image_path or not Path(image_path).exists():
@@ -35,8 +51,12 @@ def vlm_read_page(image_path: str, instruction: str) -> str:
         )
         return f"[mock vlm] {Path(image_path).name} :: {instruction}"
 
+    fname = Path(image_path).name
+    _report_progress(f"VLM 正在读取 {fname}...")
     try:
-        return _call_openai_compat(image_path, instruction, api_key)
+        result = _call_openai_compat(image_path, instruction, api_key)
+        _report_progress(f"VLM 完成 {fname}")
+        return result
     except Exception as e:
         logger.warning(f"VLM call failed ({e}); returning mock extraction")
         return f"[mock vlm:error] {Path(image_path).name} :: {instruction}"

@@ -37,6 +37,23 @@ _MOCK_HITS = [
 
 _state: dict = {"model": None, "processor": None, "indexes": None}
 
+# Progress hook — set by the backend to send SSE progress events during long ops.
+# Signature: callback(message: str) -> None
+_progress_hook: "callable | None" = None
+
+
+def set_progress_hook(hook: "callable | None") -> None:
+    global _progress_hook
+    _progress_hook = hook
+
+
+def _report_progress(msg: str) -> None:
+    if _progress_hook:
+        try:
+            _progress_hook(msg)
+        except Exception:
+            pass
+
 
 def _index_files() -> list[Path]:
     if not INDEX_DIR.exists():
@@ -63,9 +80,11 @@ def _ensure_model_loaded() -> None:
     """Lazy-load local model when remote service is not configured."""
     if _state["model"] is not None:
         return
+    _report_progress("正在加载 ColQwen2 模型到 GPU（约 60 秒）...")
     model, processor = _load_model()
     _state["model"] = model
     _state["processor"] = processor
+    _report_progress("ColQwen2 模型就绪")
 
 
 def _ensure_loaded() -> bool:
@@ -78,6 +97,11 @@ def _ensure_loaded() -> bool:
     _state["indexes"] = indexes
     _ensure_model_loaded()
     return True
+
+
+def preload() -> bool:
+    """Eagerly load indexes and model. Call at startup to eliminate first-request cold start."""
+    return _ensure_loaded()
 
 
 def _encode_query_remote(query: str) -> "torch.Tensor | None":
@@ -122,6 +146,7 @@ def _in_memory_retrieve(
     doc_filter: Optional[list[str]],
 ) -> list[PageHit]:
     if not _ensure_loaded():
+        _report_progress("检索索引为空，返回 mock 结果")
         logger.warning(f"no retriever index found under {INDEX_DIR} — returning mock hits")
         hits = _MOCK_HITS
         if doc_filter:
@@ -135,6 +160,7 @@ def _in_memory_retrieve(
         return []
 
     q_emb = _encode_query(query)
+    _report_progress(f"正在 MaxSim 检索 {len(indexes)} 份文档...")
 
     all_hits: list[PageHit] = []
     for doc_id, idx in indexes.items():

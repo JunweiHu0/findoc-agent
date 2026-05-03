@@ -503,3 +503,745 @@ async def main(msg: cl.Message):
 | amber 主题灵活度 | 主题深度定制不如 Gradio 自由 | 接受"差不多 amber 即可"；不满意再 custom CSS 兜底 |
 | 多用户并发下 graph 单例 | `_app` 模块级单例 + Chainlit 异步多 session | `cl.user_session` per-session 持有 graph；或确认 graph 无可变状态后共享 |
 | 现有 ColQwen 模型加载耗时 | `colpali_tool.py` 模块级 lazy load，首请求慢 | 在 `@cl.on_chat_start` 触发预热，并用 `cl.Message` 提示加载中 |
+
+
+---
+
+## P7/P8 实施：ColQwen2 服务化 + Qdrant 多向量存储
+
+> 实施日期：2026-05-03。本节是 P7/P8 的详细代码逻辑说明，配合 DEVLOG §"2026-05-03 P7 / P8 / P9 实施记录" 使用。DEVLOG 讲改了什么文件、为什么这么改；LEARNLOG 讲代码怎么运作的。
+
+---
+
+### 一、架构全景图（改造前 vs 改造后）
+
+**改造前**（P7/P8 之前）：
+```
+Chainlit worker (GPU)                  
+  ├── colpali_tool.py                  
+  │     ├── 加载 ColQwen2 模型（~8GB VRAM）
+  │     ├── encode_query(text) → embedding [Tq, 128]
+  │     ├── 加载 data/index/*/embeddings.pt（mmap → 内存）
+  │     └── Python _maxsim(q_emb, doc_emb) → top-k pages
+  └── agent 节点（Planner / Executor / Verifier / Synthesizer）
+```
+
+**改造后**（P7 + P8 全启用）：
+```
+Chainlit worker (CPU-only)             ColQwen Service (GPU, Litserve)
+  ├── colpali_tool.py                  ├── POST /predict                     
+  │     ├── httpx → /predict ──────────►│     ├── encode_query(text) → emb    
+  │     └── httpx → Qdrant ──┐         │     └── encode_pages(images) → emb  
+  └── agent 节点              │         └─────────────────────────────────────
+                              │
+                     Qdrant (Docker)
+                       ├── collection: findoc_pages
+                       ├── MultiVector + MaxSim (server-side)
+                       └── doc_id / page_num / image_path payload
+```
+
+**默认行为不依赖任何新服务**：`config.retriever.backend: in_memory` + `config.services.colqwen_url: ""` → 完全等同于改造前。
+
+---
+
+### 二、P7 核心代码逻辑
+
+#### 2.1 `ingestion/model_loader.py` — 共享模块
+
+这是 P7 的基石。原本 `build_index.py` 和 `colpali_tool.py` 各有一份 `_load_model_and_processor()`，P7 提取到共享模块。
+
+```
+load_model_and_processor(lora_path=None)
+  │
+  ├── 读 config.retriever.backbone → 决定加载 ColQwen2 还是 ColPali
+  ├── 读 config.retriever.dtype → torch.bfloat16 / float16 / float32
+  ├── resolve_path(config.retriever.model_name) → 绝对路径
+  ├── ModelCls.from_pretrained(model_name, torch_dtype=dtype, device_map=device)
+  │     └── .eval()
+  ├── 如有 lora_path（参数或 config）：PeftModel.from_pretrained → merge_and_unload
+  └── ProcessorCls.from_pretrained(model_name)
+  → (model, processor)
+
+encode_query(model, processor, query)
+  │
+  ├── processor.process_queries([query]) → batch dict
+  ├── batch.to(model.device)
+  ├── with torch.no_grad(): emb = model(**batch)
+  └── emb.to("cpu", dtype=torch.float16)[0]  → [Tq, 128]
+
+encode_pages(model, processor, image_paths, batch_size)
+  │
+  ├── for batch in image_paths:
+  │     ├── Image.open(p).convert("RGB") for p in batch
+  │     ├── processor.process_images(images) → batch dict
+  │     ├── model(**batch) → emb [B, T, 128]
+  │     ├── emb.cpu().float16()
+  │     ├── img.close(); torch.cuda.empty_cache()
+  │     └── append to chunks[]
+  ├── 对齐 token 数：所有 chunk 的 dim=1（token 数）可能不同
+  │     └── max_tokens = max(c.shape[1])
+  │     └── pad 较短的 chunk 到 max_tokens（zero-padding）
+  └── torch.cat(chunks, dim=0) → [P, max_T, 128]
+```
+
+**为何 token 数会不同**：ColQwen2 的 vision encoder 对每张图片的输出 token 数取决于图片分辨率。不同页面可能渲染出不同尺寸的 PNG，导致 token 数差异。pad 到统一长度后才能 torch.cat。
+
+#### 2.2 `services/colqwen_server.py` — Litserve GPU 服务
+
+Litserve 是 Lightning AI 的模型服务框架，核心抽象是 `LitAPI` 四个方法：
+
+```
+class ColQwenLitAPI(ls.LitAPI):
+
+    setup(device)
+      ├── 调用 model_loader.load_model_and_processor()
+      ├── self.model, self.processor 驻留显存
+      └── 在 worker 启动时执行一次，非首请求时
+
+    decode_request(request: dict)
+      ├── request["action"] == "encode_query" → ("encode_query", request["query"])
+      └── request["action"] == "encode_pages" → ("encode_pages", [Path(p) for p in request["image_paths"]])
+
+    predict(inputs: tuple)
+      ├── action == "encode_query" → encode_query(model, processor, data)
+      │     └── 返回 {"embedding": emb.tolist()}  # serializable
+      └── action == "encode_pages" → encode_pages(model, processor, data, batch_size=1)
+            └── 返回 {"embeddings": embs.tolist()}  # serializable
+
+    encode_response(output) → output  # 原样返回 dict
+```
+
+**Litserve 配置要点**：
+- `accelerator="auto"` — 自动检测 CUDA
+- `devices=1, workers_per_device=1` — 单 GPU 单 worker，显存只够一份模型
+- `timeout=False` — 页面编码可能耗时数分钟，不限超时
+- 自动生成 `GET /health` — 在 `setup()` 完成前返回 unhealthy
+
+**encode_pages 为何 batch_size=1**：页面图片的 token 数不一致，batch > 1 时 processor 会 pad 到统一尺寸，但 pad 区域生成的 token 是垃圾信息。batch_size=1 避免浪费计算。
+
+#### 2.3 `tools/colpali_tool.py` — 远程编码集成
+
+核心改动在 `_encode_query()` 的决策逻辑：
+
+```
+_encode_query(query)
+  │
+  ├── emb = _encode_query_remote(query)
+  │     ├── 读 config.services.colqwen_url
+  │     ├── 若为空 → return None（不尝试远程）
+  │     ├── httpx.post(f"{url}/predict", json={"action":"encode_query","query":query}, timeout=30)
+  │     ├── resp.json()["embedding"] → torch.tensor(..., dtype=float16)
+  │     └── 任何异常（连接拒绝/超时/HTTP 错误）→ log warning + return None
+  │
+  ├── if emb is not None: return emb  # 远程成功
+  │
+  └── _ensure_model_loaded()          # 远程失败或未配置 → fallback 本地
+        └── _local_encode_query(_state["model"], _state["processor"], query)
+```
+
+**`_ensure_model_loaded()` vs `_ensure_loaded()` 的拆分**：
+
+```
+之前的 _ensure_loaded():
+  加载索引 + 加载模型  ← 耦合在一起
+
+P7 后的 _ensure_loaded():
+  只加载索引（数据依赖）
+  → 被 _in_memory_retrieve() 调用
+
+P7 后的 _ensure_model_loaded():
+  只加载模型（仅当需要本地编码时）
+  → 被 _encode_query() 的 fallback 路径调用
+```
+
+拆分原因：远程编码时不需要本地模型，只需索引数据（.pt 文件在内存做 MaxSim）。索引数据轻量（mmap），模型是重量的（~8GB VRAM）。
+
+#### 2.4 `ingestion/build_index.py` — 远程编码选项
+
+```
+main()
+  ├── args.colqwen_url ← CONFIG["services"]["colqwen_url"]（默认为 ""）
+  ├── if colqwen_url:
+  │     model, processor = None, None    # 不加载本地模型
+  │     logger.info(f"Using remote ColQwen Service at {colqwen_url}")
+  │   else:
+  │     model, processor = load_model_and_processor(args.lora_path)
+  │
+  └── for each doc:
+        index_doc(model, processor, doc_dir, index_dir, batch_size, colqwen_url)
+
+index_doc(...)
+  ├── 幂等检查：embeddings.pt + meta.json 都存在 → skip
+  ├── if colqwen_url:
+  │     embeddings = _encode_pages_remote(image_paths, colqwen_url, batch_size)
+  │   else:
+  │     embeddings = encode_pages(model, processor, image_paths, batch_size)
+  └── torch.save(...) + meta.json.write_text(...)
+
+_encode_pages_remote(image_paths, colqwen_url, batch_size)
+  ├── for batch in image_paths:
+  │     httpx.post(f"{url}/predict",
+  │       json={"action":"encode_pages", "image_paths": [str(p) for p in batch]},
+  │       timeout=600)  # 长超时：大批量页面编码
+  │     → data["embeddings"] → torch.tensor(float16)
+  └── pad + torch.cat（同本地编码的 token 对齐逻辑）
+```
+
+**注意**：image_paths 传的是文件系统路径字符串，不是 base64。这是因为在部署环境下，ingestion 脚本和 ColQwen Service 共享文件系统（同一台机器或共享卷）。
+
+---
+
+### 三、P8 核心代码逻辑
+
+#### 3.1 `ingestion/push_to_qdrant.py` — 索引迁移
+
+```
+main()
+  ├── client = QdrantClient(url=config.retriever.qdrant.url)
+  ├── get_or_create_collection(client, collection, recreate)
+  │     ├── if recreate: client.delete_collection(collection)
+  │     ├── if collection exists: return
+  │     └── client.create_collection(
+  │           vectors_config=VectorParams(size=128, distance=Distance.DOT),
+  │           multivector_config=MultiVectorConfig(
+  │             comparator=MultiVectorComparator.MAX_SIM))
+  │
+  └── for doc_dir in data/index/*/:
+        push_doc(client, collection, doc_dir)
+
+push_doc(client, collection, doc_dir)
+  ├── torch.load("embeddings.pt", weights_only=True)
+  │     → embeddings: [P, T, 128], page_nums: [P]
+  ├── json.load("meta.json") → doc_id, pages[]
+  │
+  ├── for i in range(P):
+  │     point = PointStruct(
+  │       id = abs(hash(f"{doc_id}__p{page_num}")) & 0x7FFFFFFFFFFFFFFF,
+  │       vector = embeddings[i].tolist(),  # [T, 128] → list[list[float]]
+  │       payload = {doc_id, page_num, image_path})
+  │     points.append(point)
+  │
+  └── client.upsert(collection, points, wait=True)
+```
+
+**关键设计决策**：
+
+1. **`Distance.DOT` 而非 `Distance.COSINE`**：Python 的 `_maxsim` 用 `torch.einsum("td,pkd->ptk", q, d)` 计算 dot product，不做归一化。Qdrant 的 DOT 距离等价于未归一化的 dot product，和 Python 实现一致。如果用 COSINE，Qdrant 会先归一化向量再算 dot product，结果不同。
+
+2. **Point ID 用 hash**：`abs(hash(f"{doc_id}__p{page_num}")) & 0x7FFFFFFFFFFFFFFF` 保证：
+   - 确定性（同样 doc_id + page_num 总是同样 ID）
+   - 正整数（Qdrant 要求 int64 > 0）
+   - 幂等性（再跑一次 push_to_qdrant 是 upsert 而非 insert，不会重复）
+
+3. **`weights_only=True`**：torch.load 安全参数，防止 pickle 反序列化攻击。
+
+#### 3.2 `tools/colpali_tool.py` — Qdrant 检索后端
+
+```
+_qdrant_retrieve(query, top_k, doc_filter)
+  │
+  ├── client = QdrantClient(url=config.retriever.qdrant.url)
+  ├── q_emb = _encode_query(query)  # [Tq, 128]，可能走远程或本地
+  ├── query_vector = q_emb.numpy().tolist()  # list[list[float]]
+  │
+  ├── 构造 filter（如果 doc_filter 不为空）：
+  │     ├── 单个 doc_id → Filter(must=[FieldCondition(key="doc_id", match=MatchValue(value=...))])
+  │     └── 多个 doc_id → Filter(must=[FieldCondition(key="doc_id", match=MatchAny(any=[...]))])
+  │
+  ├── results = client.query_points(
+  │       collection_name=collection,
+  │       query=query_vector,         # 多向量 query
+  │       query_filter=filter,        # 可选 doc 过滤
+  │       limit=top_k,                # 只取 top-k
+  │       with_payload=True)          # 带上 doc_id / page_num / image_path
+  │
+  └── for scored in results.points:
+        PageHit(doc_id=payload["doc_id"], page_num=payload["page_num"],
+                score=scored.score, image_path=payload["image_path"])
+```
+
+**Qdrant 服务端发生了什么**：
+
+1. 接收 query_vector `[Tq, 128]`（多向量 query）
+2. 对 collection 中每个 point（一页），该 point 的 vector 也是 `[Td, 128]`
+3. 计算 MaxSim：对每个 query token，找 page token 中最大 dot product；然后 sum over query tokens
+4. 返回 score 最高的 top_k 个 point，连同 payload
+
+这完全等价于 Python 的 `einsum("td,pkd->ptk") → max(dim=-1) → sum(dim=-1)`，但计算在 Qdrant 服务端完成，不占用 Python 进程的 CPU。
+
+**fallback 链**（在 `colpali_retrieve()` 中）：
+
+```python
+if backend == "qdrant":
+    try:
+        return _qdrant_retrieve(query, top_k, doc_filter)
+    except Exception:
+        logger.error("Qdrant retrieval failed, falling back to in_memory")
+        # 继续往下走 _in_memory_retrieve
+return _in_memory_retrieve(query, top_k, doc_filter)
+```
+
+任何 Qdrant 异常（连接失败、collection 不存在、超时）都自动 fallback 到本地 in_memory 检索，不会让 agent 崩溃。
+
+#### 3.3 `config.yaml` 新增配置
+
+```yaml
+retriever:
+  backend: in_memory           # "in_memory" | "qdrant"
+  qdrant:
+    url: http://localhost:6333
+    collection_name: findoc_pages
+
+services:
+  colqwen_url: ""              # "" = 本地模型, "http://localhost:8000" = 远程
+```
+
+**配置优先级**：
+- `colqwen_url: ""` → 本地加载模型（和 P7 之前一致）
+- `colqwen_url: "http://localhost:8000"` + `backend: in_memory` → 远程编码 + 本地 MaxSim
+- `colqwen_url: "http://localhost:8000"` + `backend: qdrant` → 远程编码 + Qdrant MaxSim
+- `colqwen_url: ""` + `backend: qdrant` → 本地编码 + Qdrant MaxSim
+
+四种组合全部可用，用户根据需要选择。
+
+---
+
+### 四、全链路数据流（以一次查询为例）
+
+用户输入 "贵州茅台2023年毛利率"：
+
+```
+1. Chainlit @cl.on_message
+     │
+     ├── _GRAPH.astream(state, stream_mode="updates")
+     │
+     ├── [planner] → {"plan": [SubTask(...)], "plan_cursor": 0}
+     │     └── cl.Step(name="🧠 Planner · 产出1步计划: 贵州茅台2023年毛利率…")
+     │           output = "**执行计划** — 1 步\n1. `贵州茅台2023年毛利率` [moutai_2023]"
+     │
+     ├── [executor] → {"retrieved_pages": [PageHit...], "extracted_facts": [...], ...}
+     │     │
+     │     │  colpali_retrieve("贵州茅台2023年毛利率", top_k=5)
+     │     │    ├── backend=="qdrant"?
+     │     │    │   ├── _encode_query_remote(query) → httpx → ColQwen Service → emb [Tq,128]
+     │     │    │   └── _qdrant_retrieve → httpx → Qdrant query_points → top-5 pages
+     │     │    └── backend=="in_memory"?
+     │     │        ├── _encode_query → remote (if configured) or local model
+     │     │        └── _in_memory_retrieve → Python MaxSim over .pt files
+     │     │
+     │     │  vlm_read_page(each retrieved page) → Qwen VLM → structured facts
+     │     │
+     │     └── cl.Step(name="🔧 Executor · 检索5页 · 抽取5事实 · 计算0")
+     │           output = "**检索页面** (5)\n- moutai_2023 p.042 score=9.87\n..."
+     │
+     ├── [verifier] → {"is_sufficient": True, "reflexion_iter": 1, ...}
+     │     └── cl.Step(name="🔍 Verifier · ✅ 充分")
+     │           output = "**判断**: ✅ 信息充分\n\n轮次: 1"
+     │
+     ├── [synthesizer] → {"answer": "...毛利率为94.12%...", "citations": [...]}
+     │     └── cl.Step(name="✍️ Synthesizer · 生成答案(52字符 · 5引用)")
+     │           output = "**生成答案** — 52 字符 · 5 处引用\n\n---\n\n..."
+     │
+     └── cl.Message(content=answer + citations, elements=[cl.Image(...), ...])
+```
+
+---
+
+### 五、操作命令速查
+
+```bash
+# ------ P7: ColQwen Service ------
+# 启动（GPU 机器上）
+python -m services.colqwen_server --port 8000
+# 健康检查
+curl http://localhost:8000/health
+# 测试 query 编码
+curl -X POST http://localhost:8000/predict \
+  -H 'Content-Type: application/json' \
+  -d '{"action":"encode_query","query":"贵州茅台2023年毛利率"}'
+
+# ------ P8: Qdrant ------
+# 启动
+docker compose up -d qdrant
+# 推送索引（幂等，可重复执行）
+python -m ingestion.push_to_qdrant
+# 重建 collection + 重新推送
+python -m ingestion.push_to_qdrant --recreate
+# 只推送特定文档
+python -m ingestion.push_to_qdrant --only moutai_2023
+
+# ------ 切回 in_memory ------
+# 在 config.yaml 中设 backend: in_memory 即可
+# 已有的 .pt 文件不受影响
+```
+
+
+---
+
+## P10 前后端分离 + 实时进度推送
+
+> 实施日期：2026-05-03。本节记录 FastAPI 后端 + Chainlit 前端分离的架构设计、SSE 流式协议、进度事件机制，以及 Executor 冷启动问题的排查与修复。
+
+---
+
+### 一、改造前后架构对比
+
+**改造前**（P9 之后）：
+```
+chainlit run app/chainlit_app.py   ← 单进程
+  ├── import agent.graph.compile_graph()
+  ├── _GRAPH.astream()  同进程
+  ├── tools.colpali_tool  同进程 (ColQwen2 加载到同一 GPU)
+  └── 无法独立扩缩容 / 前端崩 = 全系统崩
+```
+
+**改造后**（P10）：
+```
+终端 1: uvicorn backend.server:app --port 8001
+  ├── FastAPI + SSE
+  ├── agent/ tools/ ingestion/ (零改动)
+  ├── ColQwen2 模型启动时预加载
+  └── POST /api/v1/query → SSE 流
+
+终端 2: chainlit run app/chainlit_app.py -w
+  ├── 零 agent import (仅 httpx + SSE 消费)
+  ├── 所有业务逻辑通过 HTTP 调用
+  └── 纯 UI 层：Step 渲染 / 消息展示 / 图片引用
+```
+
+**agent/ tools/ ingestion/ 三个目录一行未改**——后端只是把它们包了一层 HTTP。
+
+---
+
+### 二、SSE 流式协议设计
+
+选择 SSE（Server-Sent Events）而非 WebSocket 或 REST polling：
+
+| 考量 | SSE | WebSocket | REST polling |
+|------|-----|-----------|-------------|
+| 通信方向 | 后端→前端单向流 | 双向 | 前端→后端拉取 |
+| Agent 输出特点 | 完美匹配（4 节点顺序输出） | 多余 | 非实时 |
+| 实现复杂度 | FastAPI `StreamingResponse` 原生支持 | 需要 ws 库 | 简单但体验差 |
+| 代理/网关兼容 | HTTP，天然兼容 | 需要 upgrade | 兼容 |
+| 断线重连 | 浏览器原生支持 | 需手写 | 需手写 |
+
+**SSE 事件格式**：
+
+```
+event: node
+data: {"node":"planner","summary":"产出1步计划: ...","content":"**执行计划** — 1 步\n..."}
+
+event: status
+data: {"type":"status","message":"正在 MaxSim 检索 14 份文档..."}
+
+event: status
+data: {"type":"status","message":"VLM 正在读取 p009.png..."}
+
+event: node
+data: {"node":"executor","summary":"检索5页 · 抽取5事实 · 计算0","content":"..."}
+
+event: node
+data: {"node":"verifier","summary":"✅ 充分","content":"..."}
+
+event: node
+data: {"node":"synthesizer","summary":"生成答案(52字符 · 5引用)","content":"..."}
+
+event: done
+data: {"type":"done","answer":"...","citations":[...],"retrieved_pages":[...]}
+```
+
+四种 event 类型：
+- `node`：一个 LangGraph 节点完成，携带 `summary`（Step 标题，35 字截断）+ `content`（Step 展开内容，markdown）
+- `status`：进度更新，Executor 内部的长时间操作（模型加载、MaxSim、VLM 页面读取）的实时状态
+- `done`：Agent 执行完成，携带最终答案、引用列表、检索页面列表
+- `error`：执行异常，携带错误信息
+
+---
+
+### 三、后端实现：`backend/server.py`
+
+#### 3.1 启动预加载
+
+```python
+@app.on_event("startup")
+async def startup():
+    colqwen_url = CONFIG.get("services", {}).get("colqwen_url", "")
+    if colqwen_url:
+        return  # P7 远程模式，跳过本地加载
+    from tools.colpali_tool import preload
+    await asyncio.to_thread(preload)  # 阻塞直到模型就绪
+```
+
+`asyncio.to_thread` 将同步的模型加载放到线程中，避免阻塞事件循环。Uvicorn 在 startup 事件完成前不 accept 连接，因此首个请求到达时模型一定已在内存。
+
+#### 3.2 SSE 流与线程模型
+
+核心矛盾：Agent 图执行是同步阻塞的（`_GRAPH.stream` 一次 `for` 迭代可能卡 10-70 秒），但 SSE 需要持续推送进度事件。
+
+解决方案：**后台线程 + 双队列**
+
+```
+┌─ Thread: _run_agent_sync ─────────────────────┐
+│                                                 │
+│  _GRAPH.stream(state)                           │
+│    ├─ planner 完成 → node_queue.put(...)        │
+│    ├─ executor 执行中...                         │
+│    │    └─ colpali_tool._report_progress() ──┐  │
+│    │    └─ vlm_tool._report_progress() ─────┤  │
+│    │                                         │  │
+│    ├─ executor 完成 → node_queue.put(...)    │  │
+│    └─ ... → node_queue.put(("__done__",..))  │  │
+│                                                 │
+└─────────────────────────────────────────────────┘
+                     │                │
+              node_queue         progress_queue
+            (node results)    (进度消息字符串)
+                     │                │
+┌─ Async event loop (主线程) ────────────────────┐
+│                                                 │
+│  while True:                                    │
+│    drain progress_queue  → yield event: status  │
+│    drain node_queue       → yield event: node   │
+│    if __done__: break                          │
+│    await asyncio.sleep(0.3)  ← 300ms 轮询间隔  │
+│                                                 │
+└─────────────────────────────────────────────────┘
+```
+
+关键代码（`backend/server.py`）：
+
+```python
+node_queue: queue.Queue = queue.Queue()
+progress_queue: queue.Queue = queue.Queue()
+
+def _on_progress(msg: str) -> None:
+    progress_queue.put(msg)
+
+def _run_agent_sync(state: dict) -> None:
+    # 接线进度回调
+    set_colpali_hook(_on_progress)
+    set_vlm_hook(_on_progress)
+
+    accumulated = dict(state)
+    for chunk in _GRAPH.stream(state, stream_mode="updates"):
+        for node_name, delta in chunk.items():
+            node_queue.put((node_name, delta))
+            # merge delta to accumulated...
+
+    node_queue.put(("__done__", accumulated))
+
+async def event_stream():
+    thread = threading.Thread(target=_run_agent_sync, args=(state,), daemon=True)
+    thread.start()
+
+    while True:
+        # 优先排空进度队列
+        while True:
+            try:
+                msg = progress_queue.get_nowait()
+                yield f"event: status\ndata: {json.dumps({'type':'status','message':msg})}\n\n"
+            except queue.Empty:
+                break
+
+        # 检查节点结果
+        try:
+            node_name, data = node_queue.get_nowait()
+            if node_name == "__done__":
+                break
+            # yield event: node ...
+        except queue.Empty:
+            yield ": keepalive\n\n"   # 防止代理超时断开
+            await asyncio.sleep(0.3)  # 轮询间隔
+```
+
+#### 3.3 其他端点
+
+```python
+@app.get("/api/v1/docs")
+async def list_docs():
+    # 读 doc_memory.json → 返回文档列表
+    # 前端 @cl.on_chat_start 调用此端点展示已索引文档
+
+@app.get("/api/v1/health")
+async def health():
+    # 返回 {"status":"ok", "docs_count":14, "backend":"in_memory"}
+```
+
+---
+
+### 四、前端实现：`app/chainlit_app.py`
+
+#### 4.1 纯前端原则
+
+链式导入检查——前端只允许 import：
+- `chainlit`（UI 框架）
+- `httpx`（HTTP 客户端）
+- `agent.config` → `CONFIG`（读后端 URL）+ `PAGES_DIR`（解析图片路径）
+- 标准库（`json` / `pathlib` / `sys`）
+
+**不允许** import `agent.graph` / `tools.*` / `ingestion.*`。
+
+#### 4.2 SSE 消费
+
+```python
+@cl.on_message
+async def on_message(msg: cl.Message):
+    _status_step = None
+
+    async with httpx.AsyncClient() as client:
+        async with client.stream("POST", f"{_BACKEND_URL}/api/v1/query",
+                                  json={"query": query}, timeout=300.0) as resp:
+            async for line in resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                data = json.loads(line[5:].strip())
+                etype = data.get("type", "")
+
+                if etype == "status":
+                    # 动态更新进度 Step（名字随消息变化）
+                    msg_text = data["message"]
+                    if _status_step is None:
+                        _status_step = cl.Step(name=f"⏳ {msg_text}", type="tool")
+                        await _status_step.send()
+                    else:
+                        _status_step.name = f"⏳ {msg_text}"
+                        await _status_step.update()
+
+                elif etype == "done":
+                    if _status_step:
+                        _status_step.name = "✅ 完成"
+                        await _status_step.update()
+                    # 提取最终答案、引用、检索页面
+                    # → cl.Message(content=answer, elements=images)
+
+                elif "node" in data:
+                    # 创建可折叠 Step，名字 = emoji + 35字摘要
+                    label = _NODE_LABELS[data["node"]]
+                    step_name = f"{label} · {_truncate(data['summary'], 35)}"
+                    async with cl.Step(name=step_name, type="tool") as step:
+                        step.output = data["content"]
+```
+
+#### 4.3 进度 Step 的 UX
+
+进度 Step 是一个名字随消息变化的 `cl.Step`：
+
+```
+⏳ 正在 MaxSim 检索 14 份文档...        ← 名字实时更新
+⏳ VLM 正在读取 p009.png...
+⏳ VLM 完成 p009.png
+⏳ VLM 正在读取 p016.png...
+...
+✅ 完成                                  ← done 事件时切换
+```
+
+用户不再面对 80 秒空白——每一步都看得到。
+
+---
+
+### 五、进度回调机制
+
+**问题**：`astream` 在 Executor 被模型加载（~70s）和 VLM API 调用（~10s）阻塞，主循环无法推送进度。而工具函数是同步的，不能 await。
+
+**方案**：模块级回调 + 线程安全队列，最小化侵入。
+
+#### 5.1 工具侧（`tools/colpali_tool.py`、`tools/vlm_tool.py`）
+
+```python
+# 模块级全局，默认 None（无进度推送）
+_progress_hook: "callable | None" = None
+
+def set_progress_hook(hook):
+    global _progress_hook
+    _progress_hook = hook
+
+def _report_progress(msg: str):
+    if _progress_hook:
+        _progress_hook(msg)   # 同步回调，约 1μs
+
+# 在长操作点调用 _report_progress
+def _ensure_model_loaded():
+    _report_progress("正在加载 ColQwen2 模型到 GPU（约 60 秒）...")
+    model, processor = _load_model()
+    _report_progress("ColQwen2 模型就绪")
+
+def vlm_read_page(image_path, instruction):
+    fname = Path(image_path).name
+    _report_progress(f"VLM 正在读取 {fname}...")
+    result = _call_openai_compat(image_path, instruction, api_key)
+    _report_progress(f"VLM 完成 {fname}")
+    return result
+```
+
+**侵入性**：每个文件加 ~15 行，只加在确实耗时的操作点。不影响任何现有函数签名和返回值。
+
+#### 5.2 后端侧（`backend/server.py`）
+
+```python
+def _on_progress(msg: str) -> None:
+    progress_queue.put(msg)  # thread-safe
+
+def _run_agent_sync(state):
+    set_colpali_hook(_on_progress)
+    set_vlm_hook(_on_progress)
+    # ... run graph ...
+```
+
+回调在后台线程中执行，`_on_progress` 只是往 `queue.Queue` push 一个字符串（thread-safe, lock-free），开销 < 1μs。
+
+---
+
+### 六、关键验证数据
+
+首次请求（模型已在 startup 预加载）：
+
+```
+[  5.9s] 🧠 Planner        gap 5.9s  ← DeepSeek API
+        ⏳ 正在 MaxSim 检索 14 份文档...    ← 实时推送！
+        ⏳ VLM 正在读取 p001.png...
+        ⏳ VLM 完成 p001.png
+        ... (×5 pages)
+[ 16.0s] 🔧 Executor       gap 10.1s ← MaxSim + VLM × 5
+[ 20.8s] 🔍 Verifier       gap  4.8s ← DeepSeek API
+[ 25.4s] ✍️ Synthesizer    gap  4.6s ← DeepSeek API
+[total: ~25s]  冷启动需额外 +70s（模型加载），但 startup 已预加载
+```
+
+验证 SSE 进度事件数量（curl 实测）：
+
+```
+event: node        ← planner
+event: status      ← 11 条进度消息，在 Executor 执行期间实时推送
+event: status      ←   包括 MaxSim 进度 + 10 条 VLM 页面读取进度
+...
+event: status
+event: node        ← executor
+event: node        ← verifier
+event: node        ← synthesizer
+event: done
+```
+
+---
+
+### 七、操作命令速查
+
+```bash
+# ------ 后端 ------
+PYTHONPATH=. uvicorn backend.server:app --host 0.0.0.0 --port 8001
+# 启动日志:
+#   Preloading ColQwen2 model and indexes ...
+#   ColQwen2 model warm — ready to serve
+#   Application startup complete.
+
+# ------ 前端 ------
+chainlit run app/chainlit_app.py -w
+# 需后端先启动，否则显示 "无法连接后端" 提示
+
+# ------ 测试 SSE（不用前端）------
+curl -X POST http://localhost:8001/api/v1/query \
+  -H 'Content-Type: application/json' \
+  -d '{"query":"贵州茅台2023年毛利率"}' \
+  --no-buffer
+
+# 期望输出：event: node ... event: status ... event: node ... event: done
+```

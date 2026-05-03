@@ -49,3 +49,9 @@ ingestion:
 # --- External services ---
 services:
   colqwen_url: ""                            # "http://localhost:8000" when ColQwen Service is up; empty = local model
+
+# --- Backend server ---
+backend:
+  host: "0.0.0.0"
+  port: 8001
+  url: "http://localhost:8001"               # frontend connects to this URL
