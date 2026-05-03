@@ -1,84 +1,138 @@
-/* FinDoc Agent · Chainlit custom polish
- * 与 Gradio 版本的 amber 视觉保持一致：主色 #d97706, soft #fef3c7, tint #fffbeb
- * 仅覆盖 Chainlit 默认 token 控制不到的细节，保留官方主题骨架。
+/* FinDoc Agent — visual polish (borders, gradients, shadows).
+ * Colour tokens are set via public/theme.json — do NOT duplicate here.
  */
 
 :root {
-  --findoc-accent: #d97706;
+  --findoc-accent:       #d97706;
   --findoc-accent-hover: #b45309;
-  --findoc-accent-soft: #fef3c7;
-  --findoc-accent-tint: #fffbeb;
-  --findoc-warm-border: #fde68a;
-  --findoc-ink: #292524;
-  --findoc-ink-soft: #57534e;
+  --findoc-accent-soft:  #fef3c7;
+  --findoc-warm-border:  #fde68a;
 }
 
-/* 用户气泡：暖色渐变 + amber 边 */
-.message[data-step-type="user_message"] .message-content,
-[data-test="user-message"] .message-content {
+/* ============================================================
+   Steps — collapsible agent nodes
+   ============================================================ */
+[class*="step"],
+[class*="Step"] {
+  border-left: 3px solid var(--findoc-accent) !important;
+  border-radius: 6px !important;
+}
+
+[class*="step"] [class*="name"],
+[class*="Step"] [class*="name"],
+[class*="step-header"] {
+  font-weight: 600 !important;
+}
+
+/* ============================================================
+   Code blocks
+   ============================================================ */
+code:not(pre code) {
+  background: var(--findoc-accent-soft) !important;
+  color: var(--findoc-accent-hover) !important;
+  padding: 2px 6px !important;
+  border-radius: 4px !important;
+  font-size: 0.88em !important;
+}
+
+pre {
+  background: #1c1917 !important;
+  color: #e7e5e4 !important;
+  padding: 12px 16px !important;
+  border-radius: 8px !important;
+  overflow-x: auto !important;
+}
+
+pre code {
+  background: transparent !important;
+  color: #e7e5e4 !important;
+}
+
+/* ============================================================
+   User message — warm amber gradient bubble
+   ============================================================ */
+.message[data-test="user-message"] [class*="content"],
+[class*="message"][class*="user"] [class*="content"] {
   background: linear-gradient(135deg, var(--findoc-accent-soft), #fde68a) !important;
   border: 1px solid var(--findoc-warm-border) !important;
-  color: var(--findoc-ink) !important;
+  color: #292524 !important;
 }
 
-/* 助手气泡：白底 + 浅边 + 微阴影 */
-.message[data-step-type="assistant_message"] .message-content {
+/* Assistant message */
+.message[data-test="assistant-message"] [class*="content"] {
   background: #ffffff !important;
   border: 1px solid #e7e5e4 !important;
   box-shadow: 0 1px 2px rgba(120, 113, 108, 0.08) !important;
 }
 
-/* Step 折叠面板：左侧 amber 强调条 */
-.step {
-  border-left: 3px solid var(--findoc-accent) !important;
-  padding-left: 12px !important;
-  background: var(--findoc-accent-tint) !important;
-  border-radius: 6px !important;
-  margin: 4px 0 !important;
-}
-
-.step .step-name {
-  color: var(--findoc-accent-hover) !important;
-  font-weight: 600 !important;
-}
-
-/* Starter 卡片：暖色 hover */
-[data-test="starter"]:hover {
-  border-color: var(--findoc-accent) !important;
-  background: var(--findoc-accent-tint) !important;
-}
-
-/* 引用图缩略图：圆角 + 边框 */
-.message-image,
-[data-test="message-image"] img {
-  border-radius: 8px !important;
-  border: 1px solid var(--findoc-warm-border) !important;
-  max-width: 240px !important;
-}
-
-/* 顶部栏：白→amber 渐变收尾 */
+/* ============================================================
+   Header — amber gradient bar
+   ============================================================ */
 header,
-.cl-header {
-  background: linear-gradient(90deg, #ffffff 0%, var(--findoc-accent-tint) 70%, var(--findoc-accent-soft) 100%) !important;
+[class*="Header"],
+[class*="header"] {
+  background: linear-gradient(90deg, #ffffff 0%, #fffbeb 70%, #fef3c7 100%) !important;
   border-bottom: 1px solid #e7e5e4 !important;
 }
 
-/* 主 CTA 按钮 */
-button[data-test="send-button"],
-button.MuiButton-containedPrimary {
+/* ============================================================
+   Retrieved page thumbnails
+   ============================================================ */
+[class*="message"] img:not([class*="avatar"]),
+[class*="image-element"],
+img[class*="inline-image"] {
+  border-radius: 8px !important;
+  border: 1px solid var(--findoc-warm-border) !important;
+}
+
+/* ============================================================
+   Send button
+   ============================================================ */
+[data-test="send-button"],
+[class*="SendButton"] button {
   background-color: var(--findoc-accent) !important;
 }
 
-button[data-test="send-button"]:hover,
-button.MuiButton-containedPrimary:hover {
+[data-test="send-button"]:hover,
+[class*="SendButton"] button:hover {
   background-color: var(--findoc-accent-hover) !important;
 }
 
-/* 行内引用 code（[doc_id p.X]）：暖色高亮 */
-.message-content code {
+/* ============================================================
+   Starter cards
+   ============================================================ */
+[data-test="starter"]:hover {
+  border-color: var(--findoc-accent) !important;
+  background: #fffbeb !important;
+}
+
+/* ============================================================
+   Inline references [doc_id p.X]
+   ============================================================ */
+[class*="message"] code {
   background: var(--findoc-accent-soft) !important;
   color: var(--findoc-accent-hover) !important;
   padding: 1px 6px !important;
   border-radius: 4px !important;
   font-size: 0.9em !important;
+}
+
+/* ============================================================
+   Dark theme
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  [class*="step"],
+  [class*="Step"] {
+    background: #292524 !important;
+    border-left-color: var(--findoc-accent) !important;
+  }
+
+  .message[data-test="user-message"] [class*="content"] {
+    background: linear-gradient(135deg, #78350f, #92400e) !important;
+    border-color: #b45309 !important;
+    color: #fef3c7 !important;
+  }
+
+  pre { background: #1c1917 !important; }
+  pre code { color: #e7e5e4 !important; }
 }

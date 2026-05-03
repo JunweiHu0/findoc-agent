@@ -18,3 +18,4 @@ DEVLOG.md
 .DS_Store
 *.log
 wandb/
+.files/

@@ -1,15 +1,11 @@
-"""Chainlit frontend for FinDoc Agent — minimal, LangGraph-native.
+"""Chainlit frontend for FinDoc Agent — P9: detailed workflow visibility.
 
 Run:
     chainlit run app/chainlit_app.py -w
 
-Why Chainlit over the Gradio app (see LEARNLOG §"前端选型"):
-    - LangchainCallbackHandler renders每个 LangGraph 节点为可折叠 Step 自动
-    - cl.Image 元素天然展示召回页缩略图（点击放大）
-    - 后端零改动：`agent/`、`tools/`、`ingestion/` 完全不动
-
-This file replaces the chat plumbing in `gradio_app.py`. The Gradio app
-is kept as a fallback while Chainlit is being polished.
+Each LangGraph node creates a cl.Step with a descriptive name (30-char truncated
+summary of what the node produced) and full delta content shown when expanded.
+The auto-rendering is preserved through manual Step creation in the astream loop.
 """
 from __future__ import annotations
 
@@ -18,9 +14,6 @@ import sys
 from pathlib import Path
 from typing import Any
 
-# Chainlit's `load_module` imports this file by spec without injecting the
-# project root into sys.path — unlike `python -m app.chainlit_app`. We bootstrap
-# it manually so `from agent.* import ...` resolves regardless of CWD.
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
@@ -32,29 +25,108 @@ from agent.config import INDEX_DIR, PAGES_DIR
 from agent.graph import compile_graph
 from agent.state import Citation, PageHit
 
-
-# ---------------------------------------------------------------------------
-# Graph: compile once at import. Stateless across sessions; safe to share.
-# (Per-session mutable state lives entirely in AgentState passed to invoke.)
-# ---------------------------------------------------------------------------
 _GRAPH = compile_graph()
 
-
-# Suppress noisy internal langgraph runnables; surface only the four agent
-# nodes (planner / executor / verifier / synthesizer) plus their LLM calls.
-_CALLBACK_IGNORE = [
-    "ChannelRead",
-    "ChannelWrite",
-    "RunnableLambda",
-    "RunnableSequence",
-    "RunnableParallel",
-    "RunnableAssign",
-    "LangGraph",
-]
+_NODE_LABELS: dict[str, str] = {
+    "planner": "\U0001f9e0 Planner",
+    "executor": "\U0001f527 Executor",
+    "verifier": "\U0001f50d Verifier",
+    "synthesizer": "✍️ Synthesizer",
+}
 
 
 # ---------------------------------------------------------------------------
-# Doc memory helpers (mirrored from gradio_app for self-containment)
+# Helpers
+# ---------------------------------------------------------------------------
+def _summarize_node(node: str, delta: dict[str, Any]) -> str:
+    """Plain-text one-liner summarising what a node produced.  Used in Step names."""
+    if node == "planner":
+        plan = delta.get("plan") or []
+        if not plan:
+            return "未生成计划"
+        first = plan[0].sub_query if hasattr(plan[0], "sub_query") else str(plan[0])
+        return f"产出{len(plan)}步计划: {first}"
+    if node == "executor":
+        pages = len(delta.get("retrieved_pages") or [])
+        facts = len(delta.get("extracted_facts") or [])
+        cvs = len(delta.get("computed_values") or [])
+        return f"检索{pages}页 · 抽取{facts}事实 · 计算{cvs}"
+    if node == "verifier":
+        return "✅ 充分" if delta.get("is_sufficient") else "↻ 触发再检索"
+    if node == "synthesizer":
+        ans = delta.get("answer") or ""
+        cites = len(delta.get("citations") or [])
+        return f"生成答案({len(ans)}字符 · {cites}引用)"
+    return "完成"
+
+
+def _format_delta(node: str, delta: dict[str, Any]) -> str:
+    """Render the complete node delta as structured markdown for the Step body."""
+    if node == "planner":
+        plan = delta.get("plan") or []
+        if not plan:
+            return "*(空计划)*"
+        lines = [f"**执行计划** — {len(plan)} 步\n"]
+        for i, task in enumerate(plan):
+            sq = task.sub_query if hasattr(task, "sub_query") else str(task)
+            td = getattr(task, "target_doc", None)
+            target = f" `[{td}]`" if td else ""
+            es = getattr(task, "expected_output_schema", "text")
+            lines.append(f"{i+1}. `{sq}`{target}  → *{es}*")
+        return "\n".join(lines)
+
+    if node == "executor":
+        parts: list[str] = []
+        pages: list[PageHit] = delta.get("retrieved_pages") or []
+        if pages:
+            parts.append(f"**检索页面** ({len(pages)})\n")
+            for p in pages:
+                parts.append(f"- `{p.doc_id}` p.{p.page_num:03d}  score={p.score:.4f}")
+        facts = delta.get("extracted_facts") or []
+        if facts:
+            parts.append(f"\n**抽取事实** ({len(facts)})\n")
+            for f in facts:
+                src = getattr(f, "source_doc", "?")
+                sp = getattr(f, "source_page", "?")
+                parts.append(f"- [{src} p.{sp}] {f.text}")
+        values = delta.get("computed_values") or []
+        if values:
+            parts.append(f"\n**计算结果** ({len(values)})\n")
+            for v in values:
+                parts.append(f"- `{v.expr}` = **{v.value}**")
+        return "\n".join(parts) if parts else "*(无输出)*"
+
+    if node == "verifier":
+        suff = "✅ 信息充分" if delta.get("is_sufficient") else "❌ 信息不充分"
+        miss = delta.get("missing_info") or ""
+        out = f"**判断**: {suff}"
+        if miss:
+            out += f"\n\n**缺失信息**: {miss}"
+        reflexion = delta.get("reflexion_iter")
+        if reflexion is not None:
+            out += f"\n\n轮次: {reflexion}"
+        return out
+
+    if node == "synthesizer":
+        ans = delta.get("answer") or ""
+        cites = delta.get("citations") or []
+        out = f"**生成答案** — {len(ans)} 字符 · {len(cites)} 处引用\n\n---\n\n{ans}"
+        if cites:
+            out += "\n\n---\n\n**引用**: " + " ".join(
+                f"`[{c.doc_id} p.{c.page_num}]`" for c in cites
+            )
+        return out
+
+    return f"```json\n{json.dumps(delta, ensure_ascii=False, indent=2, default=str)}\n```"
+
+
+def _truncate(text: str, n: int = 35) -> str:
+    text = text.strip().replace("\n", " ")
+    return text[:n] + ("…" if len(text) > n else "")
+
+
+# ---------------------------------------------------------------------------
+# Doc memory & page helpers
 # ---------------------------------------------------------------------------
 def _load_doc_memory() -> list[dict]:
     mem_path = INDEX_DIR / "doc_memory.json"
@@ -92,7 +164,6 @@ def _format_citations(citations: list[Citation]) -> str:
 
 
 def _page_elements(pages: list[PageHit]) -> list[cl.Image]:
-    """De-dup retrieved pages and resolve to inline cl.Image elements."""
     seen: set[tuple[str, int]] = set()
     elements: list[cl.Image] = []
     for hit in pages or []:
@@ -119,19 +190,19 @@ def _page_elements(pages: list[PageHit]) -> list[cl.Image]:
 async def starters():
     return [
         cl.Starter(
-            label="📊 茅台 2023 年营收",
-            message="贵州茅台 2023 年的营业收入是多少？",
+            label="\U0001f4ca 茅台 2023 年营收",
+            message="贵州茅台2023年的营业收入是多少？",
         ),
         cl.Starter(
-            label="🆚 毛利率对比",
+            label="\U0001f53c 毛利率对比",
             message="对比贵州茅台、宁德时代 2023 年的毛利率",
         ),
         cl.Starter(
-            label="👥 招行员工数",
+            label="\U0001f465 招行员工数",
             message="招商银行 2024 年末员工总数是多少？",
         ),
         cl.Starter(
-            label="🧪 恒瑞研发占比",
+            label="\U0001f9ea 恒瑞研发占比",
             message="恒瑞医药 2024 年研发投入占营业收入的比例",
         ),
     ]
@@ -159,25 +230,39 @@ async def on_chat_start():
 async def on_message(msg: cl.Message):
     query = (msg.content or "").strip()
     if not query:
-        await cl.Message(content="_(请输入问题)_").send()
+        await cl.Message(content="*(请输入问题)*").send()
         return
 
-    cb = cl.LangchainCallbackHandler(
-        stream_final_answer=False,
-        to_ignore=_CALLBACK_IGNORE,
-    )
     state = _initial_state(query)
+    accumulated: dict[str, Any] = dict(state)
 
+    # ---- stream LangGraph nodes as individually collapsible Steps ----
     try:
-        final = await _GRAPH.ainvoke(state, config={"callbacks": [cb]})
+        async for chunk in _GRAPH.astream(state, stream_mode="updates"):
+            for node_name, delta in chunk.items():
+                summary = _summarize_node(node_name, delta)
+                label = _NODE_LABELS.get(node_name, node_name)
+                step_name = f"{label} · {_truncate(summary, 35)}"
+
+                async with cl.Step(name=step_name, type="tool") as step:
+                    step.output = _format_delta(node_name, delta)
+
+                # Merge delta into accumulated state
+                for key, value in delta.items():
+                    if key in accumulated and isinstance(accumulated[key], list) and isinstance(value, list):
+                        accumulated[key] = accumulated[key] + value
+                    else:
+                        accumulated[key] = value
+
     except Exception as e:
-        logger.exception("graph invocation failed")
+        logger.exception("graph streaming failed")
         await cl.Message(content=f"❌ Agent 执行失败：`{type(e).__name__}: {e}`").send()
         return
 
-    answer = (final.get("answer") or "_(空回答)_").strip()
-    citations = final.get("citations") or []
+    # ---- final answer message ----
+    answer = (accumulated.get("answer") or "*(空回答)*").strip()
+    citations = accumulated.get("citations") or []
     answer += _format_citations(citations)
 
-    elements = _page_elements(final.get("retrieved_pages") or [])
+    elements = _page_elements(accumulated.get("retrieved_pages") or [])
     await cl.Message(content=answer, elements=elements).send()
