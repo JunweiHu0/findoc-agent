@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
+
 from loguru import logger
 
 from tools.calculator import calculate
@@ -36,9 +38,17 @@ def _run_retrieval(sub_task, cursor: int) -> dict:
     doc_filter = [sub_task.target_doc] if sub_task.target_doc else None
     hits = colpali_retrieve(sub_task.sub_query, top_k=TOP_K, doc_filter=doc_filter)
 
+    if not hits:
+        texts: list[str] = []
+    else:
+        with ThreadPoolExecutor(max_workers=min(len(hits), 5)) as ex:
+            texts = list(ex.map(
+                lambda h: vlm_read_page(h.image_path or "", instruction=sub_task.sub_query),
+                hits,
+            ))
+
     facts: list[Fact] = []
-    for hit in hits:
-        text = vlm_read_page(hit.image_path or "", instruction=sub_task.sub_query)
+    for hit, text in zip(hits, texts):
         facts.append(Fact(
             text=text,
             source_doc=hit.doc_id,

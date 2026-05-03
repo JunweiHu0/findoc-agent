@@ -18,8 +18,11 @@ latex = false
 auto_tag_thread = true
 
 [features.spontaneous_file_upload]
-# 当前架构不支持运行时上传（文档需要离线 build_index）
-enabled = false
+# P14：聊天框左侧 "+" 按钮，触发上传 → ColQwen 编码 → 自建索引
+enabled = true
+accept = ["application/pdf", "image/png", "image/jpeg", "image/bmp", "image/tiff", "image/gif", "image/webp"]
+max_files = 4
+max_size_mb = 100
 
 [UI]
 name = "FinDoc Agent"

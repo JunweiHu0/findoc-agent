@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import json
 import sys
+import uuid
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +24,19 @@ _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
-from fastapi import FastAPI
-from fastapi.responses import StreamingResponse
+from fastapi import FastAPI, Request
+from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
-from agent.config import CONFIG, INDEX_DIR
+from agent.config import CONFIG, INDEX_DIR, PAGES_DIR
 from agent.graph import compile_graph
 from agent.state import Citation, PageHit
-from backend.schemas import CitationOut, DocInfo, HealthResponse, PageHitOut, QueryRequest
+from backend.schemas import (
+    CitationOut, ConversationCreate, ConversationDetail, ConversationOut,
+    ConversationUpdate, DocInfo, DocumentOut, HealthResponse, PageHitOut,
+    QueryRequest, UploadResponse, UploadStatusOut,
+)
+from backend import storage
 
 # ---------------------------------------------------------------------------
 # Graph — module-level, stateless, safe to share across requests
@@ -181,6 +187,18 @@ async def query(req: QueryRequest):
     import queue
     import threading
 
+    # Resolve conversation: prefer caller-supplied conv_id (Chainlit thread_id);
+    # fall back to a fresh one. Auto-create the row if missing.
+    conv_id = req.conv_id
+    title = req.query.strip().replace("\n", " ")[:26]
+    if not conv_id:
+        conv = storage.create_conversation(title=title)
+        conv_id = conv["id"]
+    else:
+        existing = storage.get_conversation(conv_id)
+        if not existing:
+            storage.create_conversation_with_id(conv_id, title=title)
+
     node_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
     progress_queue: queue.Queue[str] = queue.Queue()
 
@@ -259,8 +277,20 @@ async def query(req: QueryRequest):
         citations = accumulated.get("citations") or []
         pages = accumulated.get("retrieved_pages") or []
 
+        # Persist to conversation history
+        try:
+            storage.add_message(conv_id, "user", req.query)
+            storage.add_message(
+                conv_id, "assistant", answer,
+                citations=[_citation_to_out(c).model_dump() for c in citations],
+                pages=[_page_hit_to_out(p).model_dump() for p in pages],
+            )
+        except Exception as e:
+            logger.warning(f"Failed to persist messages for conv {conv_id}: {e}")
+
         done = json.dumps({
             "type": "done",
+            "conv_id": conv_id,
             "answer": answer,
             "citations": [_citation_to_out(c).model_dump() for c in citations],
             "retrieved_pages": [_page_hit_to_out(p).model_dump() for p in pages],
@@ -300,3 +330,233 @@ async def health():
         docs_count = len(data.get("docs", []))
     backend = CONFIG["retriever"].get("backend", "in_memory")
     return HealthResponse(status="ok", docs_count=docs_count, backend=backend)
+
+
+# ---------------------------------------------------------------------------
+# P13: Conversation endpoints
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/conversations", response_model=list[ConversationOut])
+async def list_conversations():
+    return storage.list_conversations()
+
+
+@app.post("/api/v1/conversations", response_model=ConversationOut)
+async def create_conversation(body: ConversationCreate):
+    conv = storage.create_conversation(title=body.title)
+    return ConversationOut(**conv)
+
+
+@app.get("/api/v1/conversations/{conv_id}", response_model=ConversationDetail)
+async def get_conversation(conv_id: str):
+    from fastapi.responses import JSONResponse
+    conv = storage.get_conversation(conv_id)
+    if not conv:
+        return JSONResponse(status_code=404, content={"detail": "Conversation not found"})
+    return ConversationDetail(**conv)
+
+
+@app.patch("/api/v1/conversations/{conv_id}", response_model=ConversationOut)
+async def update_conversation(conv_id: str, body: ConversationUpdate):
+    from fastapi.responses import JSONResponse
+    ok = storage.update_conversation_title(conv_id, body.title)
+    if not ok:
+        return JSONResponse(status_code=404, content={"detail": "Conversation not found"})
+    conv = storage.get_conversation(conv_id)
+    return ConversationOut(**conv)
+
+
+@app.delete("/api/v1/conversations/{conv_id}")
+async def delete_conversation_endpoint(conv_id: str):
+    from fastapi.responses import JSONResponse
+    ok = storage.delete_conversation(conv_id)
+    if not ok:
+        return JSONResponse(status_code=404, content={"detail": "Conversation not found"})
+    return {"deleted": conv_id}
+
+
+# ---------------------------------------------------------------------------
+# P14: Document / Upload endpoints (stubs — pipeline in ingestion/upload.py)
+# ---------------------------------------------------------------------------
+
+@app.get("/api/v1/documents", response_model=list[DocumentOut])
+async def list_documents_all():
+    """List all documents (indexed + uploaded)."""
+    docs = storage.list_documents()
+    return [DocumentOut(**d) for d in docs]
+
+
+@app.delete("/api/v1/documents/{doc_id}")
+async def delete_doc(doc_id: str):
+    """Delete a document: pages + index + Qdrant points + DB record."""
+    from fastapi.responses import JSONResponse
+    import shutil
+
+    # Remove pages
+    pages_dir = PAGES_DIR / doc_id
+    if pages_dir.exists():
+        shutil.rmtree(pages_dir, ignore_errors=True)
+
+    # Remove index
+    index_dir = INDEX_DIR / doc_id
+    if index_dir.exists():
+        shutil.rmtree(index_dir, ignore_errors=True)
+
+    # Remove from Qdrant
+    try:
+        from qdrant_client import QdrantClient
+        from qdrant_client.models import FieldCondition, Filter, MatchValue
+        qdrant_cfg = CONFIG["retriever"].get("qdrant", {})
+        client = QdrantClient(url=qdrant_cfg.get("url", "http://localhost:6333"))
+        collection = qdrant_cfg.get("collection_name", "findoc_pages")
+        client.delete(
+            collection_name=collection,
+            points_selector=Filter(
+                must=[FieldCondition(key="doc_id", match=MatchValue(value=doc_id))]
+            ),
+        )
+        logger.info(f"Deleted Qdrant points for {doc_id}")
+    except Exception as e:
+        logger.warning(f"Qdrant delete for {doc_id} failed (may not be running): {e}")
+
+    # Remove from doc_memory and rebuild
+    mem_path = INDEX_DIR / "doc_memory.json"
+    if mem_path.exists():
+        data = json.loads(mem_path.read_text(encoding="utf-8"))
+        data["docs"] = [d for d in data.get("docs", []) if d["doc_id"] != doc_id]
+        mem_path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+
+    # Remove from SQLite
+    storage.delete_document(doc_id)
+
+    # Reload retriever indexes if running in-memory
+    retriever_backend = CONFIG["retriever"].get("backend", "in_memory")
+    if retriever_backend == "in_memory":
+        try:
+            from tools.colpali_tool import _state
+            if _state.get("indexes") is not None and doc_id in _state["indexes"]:
+                del _state["indexes"][doc_id]
+                logger.info(f"Removed {doc_id} from in-memory retriever index")
+        except Exception:
+            pass
+
+    return {"deleted": doc_id}
+
+
+# ---------------------------------------------------------------------------
+# P14: Upload endpoint
+# ---------------------------------------------------------------------------
+
+# In-memory upload progress tracking: upload_id → {doc_id, status, message, pct}
+_upload_progress: dict[str, dict] = {}
+
+
+@app.post("/api/v1/upload", response_model=UploadResponse)
+async def upload_file_handler(req: Request):
+    """Upload a PDF/image and start the ingestion pipeline asynchronously."""
+    import tempfile
+    import threading
+    from fastapi.responses import JSONResponse
+
+    try:
+        form = await req.form()
+        file = form.get("file")
+        if not file:
+            return JSONResponse(status_code=400, content={"detail": "No file provided"})
+
+        filename = getattr(file, "filename", "upload.pdf")
+        contents = await file.read()
+        if not contents:
+            return JSONResponse(status_code=400, content={"detail": "Empty file"})
+    except Exception as e:
+        return JSONResponse(status_code=400, content={"detail": f"Invalid form: {e}"})
+
+    suffix = Path(filename).suffix.lower()
+    if suffix not in {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"}:
+        return JSONResponse(
+            status_code=400,
+            content={"detail": f"Unsupported file type: {suffix}. Use PDF or image."},
+        )
+
+    # Derive doc_id and write to temp location
+    from ingestion.upload import derive_upload_doc_id, run_upload_pipeline
+    doc_id = derive_upload_doc_id(filename)
+    upload_id = uuid.uuid4().hex[:12]
+
+    _upload_progress[upload_id] = {
+        "doc_id": doc_id,
+        "status": "queued",
+        "message": "准备中...",
+        "pct": 0.0,
+    }
+
+    # Write file to temp path for pipeline
+    temp_dir = Path(tempfile.gettempdir()) / "findoc_uploads"
+    temp_dir.mkdir(parents=True, exist_ok=True)
+    temp_path = temp_dir / f"{upload_id}_{filename}"
+    temp_path.write_bytes(contents)
+
+    def _progress_cb(stage: str, msg: str, pct: float):
+        _upload_progress[upload_id] = {
+            "doc_id": doc_id,
+            "status": stage,
+            "message": msg,
+            "pct": pct,
+        }
+
+    def _run():
+        try:
+            run_upload_pipeline(str(temp_path), doc_id, progress_callback=_progress_cb)
+        except Exception as e:
+            logger.exception(f"Upload pipeline failed for {doc_id}")
+            _upload_progress[upload_id] = {
+                "doc_id": doc_id,
+                "status": "failed",
+                "message": f"{type(e).__name__}: {e}",
+                "pct": 0.0,
+            }
+        finally:
+            # Cleanup temp file
+            try:
+                temp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    threading.Thread(target=_run, daemon=True).start()
+
+    return UploadResponse(upload_id=upload_id, doc_id=doc_id, status="queued")
+
+
+@app.get("/api/v1/upload/{upload_id}/status")
+async def upload_status(upload_id: str):
+    """SSE stream for upload progress."""
+    import asyncio
+
+    if upload_id not in _upload_progress:
+        from fastapi.responses import JSONResponse
+        return JSONResponse(status_code=404, content={"detail": "Upload not found"})
+
+    async def event_stream():
+        while True:
+            info = _upload_progress.get(upload_id, {})
+            status = info.get("status", "queued")
+
+            payload = json.dumps({
+                "doc_id": info.get("doc_id", ""),
+                "status": status,
+                "message": info.get("message", ""),
+                "pct": info.get("pct", 0.0),
+            }, ensure_ascii=False)
+            yield f"data: {payload}\n\n"
+
+            if status in ("done", "failed"):
+                # Keep record for 1 hour then purge
+                break
+
+            await asyncio.sleep(0.5)
+
+    return StreamingResponse(
+        event_stream(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "Connection": "keep-alive"},
+    )

@@ -4,15 +4,21 @@ Run:
     chainlit run app/chainlit_app.py -w
 
 Requires the FastAPI backend running (default http://localhost:8001).
-All agent logic, retrieval, and LLM/VLM calls happen in the backend.
-This file only handles UI rendering: Steps, messages, images, citations.
+All agent logic, retrieval, VLM calls, persistence happen in the backend.
+
+P13: left-sidebar conversation history via custom DataLayer bridging to
+backend SQLite (see app/data_layer.py).
+
+P14: "+ attach" button on the left of the chat input (Chainlit
+spontaneous_file_upload). Attached PDFs/images upload to the backend,
+get encoded with ColQwen2, and become queryable in the same chat turn.
 """
 from __future__ import annotations
 
 import json
 import sys
 from pathlib import Path
-from typing import Any
+from typing import Optional
 
 _PROJECT_ROOT = Path(__file__).resolve().parents[1]
 if str(_PROJECT_ROOT) not in sys.path:
@@ -23,8 +29,8 @@ import httpx
 from loguru import logger
 
 from agent.config import CONFIG, PAGES_DIR
+from app.data_layer import FinDocDataLayer
 
-# Backend URL — configurable via config.yaml
 _BACKEND_URL = CONFIG.get("backend", {}).get("url", "http://localhost:8001")
 
 _NODE_LABELS: dict[str, str] = {
@@ -33,6 +39,23 @@ _NODE_LABELS: dict[str, str] = {
     "verifier": "\U0001f50d Verifier",
     "synthesizer": "✍️ Synthesizer",
 }
+
+_UPLOAD_ACCEPT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"}
+
+
+# ---------------------------------------------------------------------------
+# Chainlit data layer + auth (P13: enable threads sidebar)
+# ---------------------------------------------------------------------------
+@cl.data_layer
+def _get_data_layer():
+    return FinDocDataLayer()
+
+
+@cl.header_auth_callback
+def _auth(headers) -> Optional[cl.User]:
+    """Single-user mode — accept everyone as 'local'. Required for the
+    threads sidebar to render."""
+    return cl.User(identifier="local", metadata={"role": "user"})
 
 
 # ---------------------------------------------------------------------------
@@ -76,6 +99,120 @@ def _page_elements(pages: list[dict]) -> list[cl.Image]:
 
 
 # ---------------------------------------------------------------------------
+# P14: Inline upload — drains attachments from a Chainlit message and pushes
+# each through the backend upload pipeline. Returns the list of doc_ids
+# successfully indexed (so they can be referenced in the same turn's query).
+# ---------------------------------------------------------------------------
+async def _handle_inline_uploads(msg: cl.Message) -> list[str]:
+    files = [e for e in (msg.elements or []) if getattr(e, "path", None)]
+    if not files:
+        return []
+
+    doc_ids: list[str] = []
+    for elem in files:
+        path_str = getattr(elem, "path", None)
+        if not path_str:
+            continue
+        fpath = Path(path_str)
+        suffix = fpath.suffix.lower()
+        if suffix not in _UPLOAD_ACCEPT_SUFFIXES:
+            await cl.Message(
+                content=f"⚠️ 跳过不支持的文件 `{fpath.name}`（仅支持 PDF / 图片）",
+                author="system",
+            ).send()
+            continue
+
+        filename = getattr(elem, "name", fpath.name) or fpath.name
+        mime = getattr(elem, "mime", None) or ("application/pdf" if suffix == ".pdf" else f"image/{suffix.lstrip('.')}")
+
+        upload_step = cl.Step(name=f"📤 上传 {filename}", type="tool")
+        await upload_step.send()
+
+        try:
+            doc_id = await _upload_and_track(fpath, filename, mime, upload_step)
+            if doc_id:
+                doc_ids.append(doc_id)
+        except Exception as e:
+            logger.exception("inline upload failed")
+            upload_step.name = f"❌ {filename} 上传失败"
+            upload_step.output = f"{type(e).__name__}: {e}"
+            await upload_step.update()
+
+    return doc_ids
+
+
+async def _upload_and_track(
+    fpath: Path,
+    filename: str,
+    mime: str,
+    upload_step: cl.Step,
+) -> str | None:
+    """POST file to backend then stream SSE progress; mutate upload_step."""
+    async with httpx.AsyncClient(timeout=600.0) as client:
+        with open(fpath, "rb") as fh:
+            resp = await client.post(
+                f"{_BACKEND_URL}/api/v1/upload",
+                files={"file": (filename, fh, mime)},
+            )
+        if resp.status_code != 200:
+            try:
+                detail = resp.json().get("detail", resp.text)
+            except Exception:
+                detail = resp.text
+            upload_step.name = f"❌ {filename} 上传失败"
+            upload_step.output = str(detail)
+            await upload_step.update()
+            return None
+
+        result = resp.json()
+        upload_id = result["upload_id"]
+        doc_id = result["doc_id"]
+
+        upload_step.name = f"⏳ {filename} → `{doc_id}` 排队中"
+        await upload_step.update()
+
+        async with client.stream(
+            "GET",
+            f"{_BACKEND_URL}/api/v1/upload/{upload_id}/status",
+            timeout=600.0,
+        ) as status_resp:
+            async for line in status_resp.aiter_lines():
+                if not line.startswith("data:"):
+                    continue
+                payload_str = line[5:].strip()
+                if not payload_str:
+                    continue
+                try:
+                    info = json.loads(payload_str)
+                except json.JSONDecodeError:
+                    continue
+
+                status = info.get("status", "queued")
+                stage_msg = info.get("message", "")
+                emoji = {
+                    "save": "💾", "pages": "🖼️", "encode": "🧠",
+                    "index": "📦", "qdrant": "🗄️", "register": "📋",
+                    "done": "✅", "failed": "❌", "queued": "⏳",
+                    "encoding": "🧠",
+                }.get(status, "⏳")
+
+                upload_step.name = f"{emoji} {filename} · {stage_msg}"
+                await upload_step.update()
+
+                if status == "done":
+                    upload_step.name = f"✅ `{doc_id}` 已索引"
+                    upload_step.output = f"文档 `{doc_id}` 已可被检索。"
+                    await upload_step.update()
+                    return doc_id
+                if status == "failed":
+                    upload_step.name = f"❌ {filename} 索引失败"
+                    upload_step.output = stage_msg or "未知错误"
+                    await upload_step.update()
+                    return None
+    return None
+
+
+# ---------------------------------------------------------------------------
 # Chainlit lifecycle
 # ---------------------------------------------------------------------------
 @cl.set_starters
@@ -90,6 +227,9 @@ async def starters():
 
 @cl.on_chat_start
 async def on_chat_start():
+    cl.user_session.set("conv_id", None)
+    cl.user_session.set("uploaded_doc_ids", [])
+
     try:
         async with httpx.AsyncClient() as client:
             resp = await client.get(f"{_BACKEND_URL}/api/v1/docs", timeout=10.0)
@@ -97,7 +237,10 @@ async def on_chat_start():
             data = resp.json()
     except Exception:
         await cl.Message(
-            content=f"⚠️ **无法连接后端** `{_BACKEND_URL}`\n\n请先启动：\n```bash\nPYTHONPATH=. uvicorn backend.server:app --port 8001\n```",
+            content=(
+                f"⚠️ **无法连接后端** `{_BACKEND_URL}`\n\n请先启动：\n"
+                "```bash\nPYTHONPATH=. uvicorn backend.server:app --port 8001\n```"
+            ),
             author="system",
         ).send()
         return
@@ -105,34 +248,74 @@ async def on_chat_start():
     docs = data.get("docs") or []
     if not docs:
         await cl.Message(
-            content="⚠️ **尚未建立索引**。请先运行：\n```bash\npython -m ingestion.build_index\n```",
+            content=(
+                "📂 **尚无已索引文档**。点击聊天框左侧 **+** 上传 PDF/图片，"
+                "或运行 `python -m ingestion.build_index` 离线建索引。"
+            ),
             author="system",
         ).send()
         return
 
-    body = "**已索引文档**（共 {n} 份）\n\n".format(n=len(docs))
+    body = f"**已索引文档**（共 {len(docs)} 份）\n\n"
     body += "\n".join(f"- `{d['doc_id']}` · {d['page_count']} 页" for d in docs)
+    body += "\n\n💡 *点击聊天框左侧 **+** 可上传新的 PDF/图片建立索引。*"
     await cl.Message(content=body, author="system").send()
+
+
+@cl.on_chat_resume
+async def on_chat_resume(thread):
+    """Restore session state when resuming a thread from the sidebar."""
+    cl.user_session.set("conv_id", thread.get("id"))
+    cl.user_session.set("uploaded_doc_ids", [])
 
 
 @cl.on_message
 async def on_message(msg: cl.Message):
+    # P14 — drain any attached files first, build doc_filter from successful uploads
+    new_doc_ids = await _handle_inline_uploads(msg)
+
+    accumulated_doc_ids: list[str] = list(cl.user_session.get("uploaded_doc_ids") or [])
+    accumulated_doc_ids.extend(d for d in new_doc_ids if d not in accumulated_doc_ids)
+    cl.user_session.set("uploaded_doc_ids", accumulated_doc_ids)
+
     query = (msg.content or "").strip()
     if not query:
-        await cl.Message(content="*(请输入问题)*").send()
+        # User uploaded a file without typing anything — acknowledge and stop
+        if new_doc_ids:
+            await cl.Message(
+                content=f"✅ 已上传 {len(new_doc_ids)} 个文档。请输入你的问题，我会优先在新文档中检索。",
+                author="system",
+            ).send()
+        else:
+            await cl.Message(content="*(请输入问题)*").send()
         return
+
+    # Use Chainlit's thread_id as the canonical conversation key — this keeps
+    # the threads sidebar (data layer) and backend SQLite in sync without
+    # double-persisting messages.
+    try:
+        conv_id = cl.context.session.thread_id
+    except Exception:
+        conv_id = cl.user_session.get("conv_id")
+    cl.user_session.set("conv_id", conv_id)
 
     _status_step: cl.Step | None = None
     final_answer = ""
     final_citations: list[dict] = []
     final_pages: list[dict] = []
 
+    body: dict = {"query": query}
+    if conv_id:
+        body["conv_id"] = conv_id
+    if accumulated_doc_ids:
+        body["doc_filter"] = accumulated_doc_ids
+
     try:
         async with httpx.AsyncClient() as client:
             async with client.stream(
                 "POST",
                 f"{_BACKEND_URL}/api/v1/query",
-                json={"query": query},
+                json=body,
                 timeout=300.0,
             ) as resp:
                 if resp.status_code != 200:
@@ -159,7 +342,6 @@ async def on_message(msg: cl.Message):
                         return
 
                     if etype == "status":
-                        # Inline progress — update the running status step
                         msg_text = data.get("message", "")
                         if _status_step is None:
                             _status_step = cl.Step(name=f"⏳ {msg_text}", type="tool")
@@ -170,16 +352,17 @@ async def on_message(msg: cl.Message):
                         continue
 
                     if etype == "done":
-                        # Remove the status step when agent completes
                         if _status_step is not None:
                             _status_step.name = "✅ 完成"
                             await _status_step.update()
                         final_answer = data.get("answer", "")
                         final_citations = data.get("citations", [])
                         final_pages = data.get("retrieved_pages", [])
+                        new_conv_id = data.get("conv_id")
+                        if new_conv_id:
+                            cl.user_session.set("conv_id", new_conv_id)
                         break
 
-                    # Node update
                     node = data.get("node", "")
                     summary = data.get("summary", "")
                     content = data.get("content", "")
@@ -192,7 +375,10 @@ async def on_message(msg: cl.Message):
 
     except httpx.ConnectError:
         await cl.Message(
-            content=f"❌ **无法连接后端** `{_BACKEND_URL}`\n\n请确认后端已启动：\n```bash\nPYTHONPATH=. uvicorn backend.server:app --port 8001\n```"
+            content=(
+                f"❌ **无法连接后端** `{_BACKEND_URL}`\n\n请确认后端已启动：\n"
+                "```bash\nPYTHONPATH=. uvicorn backend.server:app --port 8001\n```"
+            )
         ).send()
         return
     except Exception as e:
@@ -200,7 +386,6 @@ async def on_message(msg: cl.Message):
         await cl.Message(content=f"❌ 连接后端异常：`{type(e).__name__}: {e}`").send()
         return
 
-    # Final answer message
     answer = final_answer or "*(空回答)*"
     answer += _format_citations(final_citations)
     elements = _page_elements(final_pages)

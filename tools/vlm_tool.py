@@ -19,7 +19,7 @@ from typing import Optional
 from loguru import logger
 
 from agent.config import CONFIG
-
+from tools.vlm_cache import get as _cache_get, put as _cache_put
 
 _VLM_CFG = CONFIG["vlm"]
 
@@ -51,11 +51,19 @@ def vlm_read_page(image_path: str, instruction: str) -> str:
         )
         return f"[mock vlm] {Path(image_path).name} :: {instruction}"
 
+    # Check cache before calling VLM API
+    cached = _cache_get(image_path, instruction)
+    if cached is not None:
+        fname = Path(image_path).name
+        _report_progress(f"VLM 缓存命中 {fname}")
+        return cached
+
     fname = Path(image_path).name
     _report_progress(f"VLM 正在读取 {fname}...")
     try:
         result = _call_openai_compat(image_path, instruction, api_key)
         _report_progress(f"VLM 完成 {fname}")
+        _cache_put(image_path, instruction, result)
         return result
     except Exception as e:
         logger.warning(f"VLM call failed ({e}); returning mock extraction")
