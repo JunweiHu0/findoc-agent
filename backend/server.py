@@ -132,7 +132,11 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
 # ---------------------------------------------------------------------------
 # Agent state helpers
 # ---------------------------------------------------------------------------
-def _initial_state(query: str) -> dict[str, Any]:
+def _initial_state(
+    query: str,
+    doc_filter: list[str] | None = None,
+    chat_history: list[dict] | None = None,
+) -> dict[str, Any]:
     return {
         "query": query,
         "plan_cursor": 0,
@@ -141,7 +145,70 @@ def _initial_state(query: str) -> dict[str, Any]:
         "retrieved_pages": [],
         "extracted_facts": [],
         "computed_values": [],
+        "doc_filter": doc_filter,
+        "chat_history": chat_history or [],
     }
+
+
+# P15: how many recent (user, assistant) pairs to inject into planner context
+_HISTORY_TURNS = 4
+
+
+async def _maybe_auto_title(conv_id: str, query: str, answer: str) -> None:
+    """P17: After the first user turn finishes, ask the LLM for a short title.
+
+    Fire-and-forget: any failure is swallowed — the conversation just keeps
+    its 26-char query stub. Only triggered when the conversation has exactly
+    one (user, assistant) pair, i.e., this was the first turn.
+    """
+    try:
+        msgs = storage.get_messages(conv_id)
+        if len(msgs) != 2:  # only act on the first complete turn
+            return
+
+        from agent.llm import get_llm, has_llm_key
+        if not has_llm_key():
+            return
+
+        import asyncio as _aio
+
+        def _summarize() -> str:
+            llm = get_llm("synthesizer")
+            prompt = (
+                "请用不超过 12 个汉字给下面这段对话起一个标题，"
+                "只返回标题本身，不要引号和句号。\n\n"
+                f"问：{query.strip()[:120]}\n答：{answer.strip()[:200]}"
+            )
+            return llm.invoke(prompt).content.strip()
+
+        title = (await _aio.to_thread(_summarize)).replace("\n", " ").strip()
+        # Strip quotes / trailing punctuation the model sometimes emits anyway.
+        title = title.strip("\"'`「」『』 \t").rstrip("。.！!？?")
+        if not title:
+            return
+        title = title[:24]  # hard ceiling — protects sidebar layout
+        storage.update_conversation_title(conv_id, title)
+        logger.info(f"auto-titled conversation {conv_id}: {title}")
+    except Exception as e:
+        logger.debug(f"auto-title skipped for {conv_id}: {e}")
+
+
+def _load_chat_history(conv_id: str) -> list[dict]:
+    """Pull the last _HISTORY_TURNS user+assistant pairs from SQLite.
+
+    Returns a list of {role, content} dicts in chronological order
+    (oldest-first), suitable for injection into AgentState.chat_history.
+    """
+    if not conv_id:
+        return []
+    try:
+        msgs = storage.get_messages(conv_id)
+    except Exception as e:
+        logger.warning(f"failed to load chat history for {conv_id}: {e}")
+        return []
+    # Keep only the trailing 2*_HISTORY_TURNS messages (one pair = 2 messages).
+    tail = msgs[-(2 * _HISTORY_TURNS):]
+    return [{"role": m["role"], "content": m["content"]} for m in tail]
 
 
 def _page_hit_to_out(hit: PageHit) -> PageHitOut:
@@ -201,16 +268,22 @@ async def query(req: QueryRequest):
 
     node_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
     progress_queue: queue.Queue[str] = queue.Queue()
+    token_queue: queue.Queue[str] = queue.Queue()  # P16: synthesizer streaming
 
     def _on_progress(msg: str) -> None:
         progress_queue.put(msg)
 
+    def _on_token(tok: str) -> None:
+        token_queue.put(tok)
+
     def _run_agent_sync(state: dict) -> None:
         """Execute agent graph synchronously in a background thread."""
+        from agent.nodes.synthesizer import set_token_hook
         from tools.colpali_tool import set_progress_hook as set_colpali_hook
         from tools.vlm_tool import set_progress_hook as set_vlm_hook
         set_colpali_hook(_on_progress)
         set_vlm_hook(_on_progress)
+        set_token_hook(_on_token)
 
         accumulated = dict(state)
         try:
@@ -228,7 +301,8 @@ async def query(req: QueryRequest):
             node_queue.put(("__error__", {"message": f"{type(e).__name__}: {e}"}))
 
     async def event_stream():
-        state = _initial_state(req.query)
+        history = _load_chat_history(conv_id)
+        state = _initial_state(req.query, req.doc_filter, history)
         thread = threading.Thread(target=_run_agent_sync, args=(state,), daemon=True)
         thread.start()
 
@@ -244,13 +318,24 @@ async def query(req: QueryRequest):
                 except queue.Empty:
                     break
 
+            # Drain synthesizer tokens (P16) — emitted while synthesizer node is still running.
+            had_token = False
+            while True:
+                try:
+                    tok = token_queue.get_nowait()
+                    payload = json.dumps({"type": "token", "token": tok}, ensure_ascii=False)
+                    yield f"event: token\ndata: {payload}\n\n"
+                    had_token = True
+                except queue.Empty:
+                    break
+
             # Drain node results
             try:
                 node_name, data = node_queue.get_nowait()
             except queue.Empty:
-                if not had_progress:
+                if not had_progress and not had_token:
                     yield ": keepalive\n\n"
-                await asyncio.sleep(0.3)
+                await asyncio.sleep(0.1 if had_token else 0.3)
                 continue
 
             if node_name == "__done__":
@@ -272,6 +357,16 @@ async def query(req: QueryRequest):
 
         thread.join()
 
+        # Final drain of any tokens that arrived after the synthesizer completed
+        # but before we read the __done__ marker.
+        while True:
+            try:
+                tok = token_queue.get_nowait()
+                payload = json.dumps({"type": "token", "token": tok}, ensure_ascii=False)
+                yield f"event: token\ndata: {payload}\n\n"
+            except queue.Empty:
+                break
+
         accumulated: dict[str, Any] = data  # data from __done__
         answer = (accumulated.get("answer") or "").strip()
         citations = accumulated.get("citations") or []
@@ -287,6 +382,9 @@ async def query(req: QueryRequest):
             )
         except Exception as e:
             logger.warning(f"Failed to persist messages for conv {conv_id}: {e}")
+
+        # P17: fire-and-forget auto-title once we have a (user, assistant) pair.
+        asyncio.create_task(_maybe_auto_title(conv_id, req.query, answer))
 
         done = json.dumps({
             "type": "done",
@@ -444,11 +542,100 @@ async def delete_doc(doc_id: str):
 
 
 # ---------------------------------------------------------------------------
+# P18: Reindex + cover preview
+# ---------------------------------------------------------------------------
+
+@app.post("/api/v1/documents/{doc_id}/reindex", response_model=UploadResponse)
+async def reindex_doc(doc_id: str):
+    """Re-run the upload pipeline for a previously uploaded document.
+
+    Source file is read from data/uploads/<doc_id>/. Returns the same
+    UploadResponse shape as /upload so the frontend can subscribe to
+    /upload/{id}/status to track progress.
+    """
+    import threading
+    from fastapi.responses import JSONResponse
+    from ingestion.upload import UPLOAD_DIR, run_upload_pipeline
+
+    doc_upload_dir = UPLOAD_DIR / doc_id
+    if not doc_upload_dir.exists():
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"No source file for {doc_id} — original upload not retained."},
+        )
+
+    # Pick the first regular file in the upload dir as the source.
+    sources = [p for p in doc_upload_dir.iterdir() if p.is_file()]
+    if not sources:
+        return JSONResponse(
+            status_code=404,
+            content={"detail": f"Upload dir empty for {doc_id}."},
+        )
+    source = sources[0]
+    upload_id = uuid.uuid4().hex[:12]
+
+    _purge_stale_uploads()
+    _upload_progress[upload_id] = {
+        "doc_id": doc_id,
+        "status": "queued",
+        "message": "重新索引排队中...",
+        "pct": 0.0,
+    }
+
+    def _progress_cb(stage: str, msg: str, pct: float):
+        import time as _t
+        entry = {"doc_id": doc_id, "status": stage, "message": msg, "pct": pct}
+        if stage in ("done", "failed"):
+            entry["finished_at"] = _t.time()
+        _upload_progress[upload_id] = entry
+
+    def _run():
+        import time as _t
+        try:
+            run_upload_pipeline(str(source), doc_id, progress_callback=_progress_cb)
+        except Exception as e:
+            logger.exception(f"Reindex pipeline failed for {doc_id}")
+            _upload_progress[upload_id] = {
+                "doc_id": doc_id, "status": "failed",
+                "message": f"{type(e).__name__}: {e}", "pct": 0.0,
+                "finished_at": _t.time(),
+            }
+
+    threading.Thread(target=_run, daemon=True).start()
+    return UploadResponse(upload_id=upload_id, doc_id=doc_id, status="queued")
+
+
+@app.get("/api/v1/documents/{doc_id}/cover")
+async def doc_cover(doc_id: str):
+    """Return the first-page PNG as a thumbnail. 404 if no pages on disk."""
+    from fastapi.responses import FileResponse, JSONResponse
+    cover = PAGES_DIR / doc_id / "p001.png"
+    if not cover.exists():
+        return JSONResponse(status_code=404, content={"detail": "No cover available"})
+    return FileResponse(str(cover), media_type="image/png")
+
+
+# ---------------------------------------------------------------------------
 # P14: Upload endpoint
 # ---------------------------------------------------------------------------
 
-# In-memory upload progress tracking: upload_id → {doc_id, status, message, pct}
+# In-memory upload progress tracking: upload_id → {doc_id, status, message, pct, finished_at}
+# Terminal entries (done/failed) are purged after _UPLOAD_TTL_SEC.
 _upload_progress: dict[str, dict] = {}
+_UPLOAD_TTL_SEC = 3600  # 1 hour
+
+
+def _purge_stale_uploads() -> None:
+    """Drop terminal upload records older than TTL. Called opportunistically
+    on each new upload — no background task needed for a single-user app."""
+    import time
+    now = time.time()
+    stale = [
+        uid for uid, info in _upload_progress.items()
+        if info.get("finished_at") and now - info["finished_at"] > _UPLOAD_TTL_SEC
+    ]
+    for uid in stale:
+        _upload_progress.pop(uid, None)
 
 
 @app.post("/api/v1/upload", response_model=UploadResponse)
@@ -483,6 +670,7 @@ async def upload_file_handler(req: Request):
     doc_id = derive_upload_doc_id(filename)
     upload_id = uuid.uuid4().hex[:12]
 
+    _purge_stale_uploads()
     _upload_progress[upload_id] = {
         "doc_id": doc_id,
         "status": "queued",
@@ -497,14 +685,19 @@ async def upload_file_handler(req: Request):
     temp_path.write_bytes(contents)
 
     def _progress_cb(stage: str, msg: str, pct: float):
-        _upload_progress[upload_id] = {
+        import time
+        entry = {
             "doc_id": doc_id,
             "status": stage,
             "message": msg,
             "pct": pct,
         }
+        if stage in ("done", "failed"):
+            entry["finished_at"] = time.time()
+        _upload_progress[upload_id] = entry
 
     def _run():
+        import time
         try:
             run_upload_pipeline(str(temp_path), doc_id, progress_callback=_progress_cb)
         except Exception as e:
@@ -514,6 +707,7 @@ async def upload_file_handler(req: Request):
                 "status": "failed",
                 "message": f"{type(e).__name__}: {e}",
                 "pct": 0.0,
+                "finished_at": time.time(),
             }
         finally:
             # Cleanup temp file

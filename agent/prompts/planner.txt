@@ -5,8 +5,17 @@ Decompose the user question into an ordered list of sub-tasks. Each sub-task mus
 Available documents (with metadata):
 {doc_metadata}
 
+Recent conversation (most-recent last; may be empty):
+{chat_history}
+
 User question:
 {query}
+
+If the user question contains coreferences ("它"/"这个"/"上述"/"该公司"/"同样"/"再算一下"…)
+or omits an entity that was clearly the focus of the previous turn, resolve the
+coreference using the most recent matching entity in the conversation above
+BEFORE writing sub_query. The sub_query you emit must be self-contained — the
+executor never sees the chat history.
 
 Return ONLY valid JSON of the form:
 {{

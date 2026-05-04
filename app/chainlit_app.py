@@ -52,7 +52,7 @@ def _get_data_layer():
 
 
 @cl.header_auth_callback
-def _auth(headers) -> Optional[cl.User]:
+async def _auth(headers) -> Optional[cl.User]:
     """Single-user mode — accept everyone as 'local'. Required for the
     threads sidebar to render."""
     return cl.User(identifier="local", metadata={"role": "user"})
@@ -213,6 +213,143 @@ async def _upload_and_track(
 
 
 # ---------------------------------------------------------------------------
+# P18: Knowledge base admin panel — list / delete / reindex / cover preview
+# ---------------------------------------------------------------------------
+def _format_ts(ts: float) -> str:
+    from datetime import datetime
+    try:
+        return datetime.fromtimestamp(ts).strftime("%Y-%m-%d %H:%M")
+    except Exception:
+        return "-"
+
+
+_STATUS_EMOJI = {
+    "queued": "⏳", "encoding": "🧠", "ready": "✅", "failed": "❌",
+}
+
+
+async def _render_doc_panel() -> None:
+    """Render the document management panel inline as a system message."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.get(f"{_BACKEND_URL}/api/v1/documents", timeout=10.0)
+            resp.raise_for_status()
+            docs = resp.json()
+    except Exception as e:
+        await cl.Message(
+            content=f"❌ 无法获取文档列表：`{type(e).__name__}: {e}`",
+            author="system",
+        ).send()
+        return
+
+    if not docs:
+        await cl.Message(
+            content="📂 暂无文档。请通过聊天框左侧 **+** 上传 PDF/图片。",
+            author="system",
+        ).send()
+        return
+
+    header = f"### ⚙️ 知识库管理（{len(docs)} 份文档）\n\n"
+    await cl.Message(content=header, author="system").send()
+
+    for d in docs:
+        doc_id = d["doc_id"]
+        emoji = _STATUS_EMOJI.get(d["status"], "·")
+        body = (
+            f"**{emoji} `{doc_id}`**\n\n"
+            f"- 源文件：`{d.get('source_filename', '-')}`\n"
+            f"- 页数：{d.get('page_count', 0)}\n"
+            f"- 上传时间：{_format_ts(d.get('created_at', 0))}\n"
+            f"- 状态：`{d.get('status', '-')}`"
+        )
+        # Cover thumbnail (first page if available)
+        elements: list = []
+        cover_path = PAGES_DIR / doc_id / "p001.png"
+        if cover_path.exists():
+            elements.append(cl.Image(path=str(cover_path), name=f"{doc_id} 封面", display="inline"))
+
+        actions = [
+            cl.Action(name="reindex_doc", payload={"doc_id": doc_id}, label="🔄 重新索引"),
+            cl.Action(name="delete_doc", payload={"doc_id": doc_id}, label="🗑 删除"),
+        ]
+        await cl.Message(
+            content=body, author="system", elements=elements, actions=actions,
+        ).send()
+
+
+@cl.action_callback("show_docs")
+async def _on_show_docs(action: cl.Action):
+    await _render_doc_panel()
+
+
+@cl.action_callback("delete_doc")
+async def _on_delete_doc(action: cl.Action):
+    doc_id = (action.payload or {}).get("doc_id")
+    if not doc_id:
+        return
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.delete(f"{_BACKEND_URL}/api/v1/documents/{doc_id}", timeout=30.0)
+        if resp.status_code != 200:
+            await cl.Message(content=f"❌ 删除失败：{resp.text}", author="system").send()
+            return
+    except Exception as e:
+        await cl.Message(content=f"❌ 删除请求异常：`{type(e).__name__}: {e}`", author="system").send()
+        return
+    await cl.Message(content=f"🗑 已删除 `{doc_id}`。", author="system").send()
+    # Drop from any session-level filter so future queries don't reference it
+    remaining = [d for d in (cl.user_session.get("uploaded_doc_ids") or []) if d != doc_id]
+    cl.user_session.set("uploaded_doc_ids", remaining)
+
+
+@cl.action_callback("reindex_doc")
+async def _on_reindex_doc(action: cl.Action):
+    doc_id = (action.payload or {}).get("doc_id")
+    if not doc_id:
+        return
+
+    step = cl.Step(name=f"🔄 `{doc_id}` 重新索引中…", type="tool")
+    await step.send()
+
+    try:
+        async with httpx.AsyncClient(timeout=600.0) as client:
+            resp = await client.post(f"{_BACKEND_URL}/api/v1/documents/{doc_id}/reindex")
+            if resp.status_code != 200:
+                step.name = f"❌ `{doc_id}` 重新索引失败"
+                step.output = resp.text
+                await step.update()
+                return
+            upload_id = resp.json().get("upload_id")
+
+            async with client.stream(
+                "GET", f"{_BACKEND_URL}/api/v1/upload/{upload_id}/status", timeout=600.0,
+            ) as status_resp:
+                async for line in status_resp.aiter_lines():
+                    if not line.startswith("data:"):
+                        continue
+                    try:
+                        info = json.loads(line[5:].strip())
+                    except json.JSONDecodeError:
+                        continue
+                    status = info.get("status", "queued")
+                    step.name = f"🔄 `{doc_id}` · {info.get('message', status)}"
+                    await step.update()
+                    if status == "done":
+                        step.name = f"✅ `{doc_id}` 重新索引完成"
+                        await step.update()
+                        return
+                    if status == "failed":
+                        step.name = f"❌ `{doc_id}` 重新索引失败"
+                        step.output = info.get("message", "")
+                        await step.update()
+                        return
+    except Exception as e:
+        step.name = f"❌ `{doc_id}` 重新索引异常"
+        step.output = f"{type(e).__name__}: {e}"
+        await step.update()
+
+
+# ---------------------------------------------------------------------------
 # Chainlit lifecycle
 # ---------------------------------------------------------------------------
 @cl.set_starters
@@ -246,6 +383,7 @@ async def on_chat_start():
         return
 
     docs = data.get("docs") or []
+    actions = [cl.Action(name="show_docs", payload={}, label="⚙️ 知识库管理")]
     if not docs:
         await cl.Message(
             content=(
@@ -253,13 +391,14 @@ async def on_chat_start():
                 "或运行 `python -m ingestion.build_index` 离线建索引。"
             ),
             author="system",
+            actions=actions,
         ).send()
         return
 
     body = f"**已索引文档**（共 {len(docs)} 份）\n\n"
     body += "\n".join(f"- `{d['doc_id']}` · {d['page_count']} 页" for d in docs)
     body += "\n\n💡 *点击聊天框左侧 **+** 可上传新的 PDF/图片建立索引。*"
-    await cl.Message(content=body, author="system").send()
+    await cl.Message(content=body, author="system", actions=actions).send()
 
 
 @cl.on_chat_resume
@@ -303,6 +442,8 @@ async def on_message(msg: cl.Message):
     final_answer = ""
     final_citations: list[dict] = []
     final_pages: list[dict] = []
+    streaming_msg: cl.Message | None = None  # P16: token-by-token typewriter
+    streamed_text = ""
 
     body: dict = {"query": query}
     if conv_id:
@@ -351,6 +492,17 @@ async def on_message(msg: cl.Message):
                             await _status_step.update()
                         continue
 
+                    if etype == "token":
+                        tok = data.get("token", "")
+                        if not tok:
+                            continue
+                        if streaming_msg is None:
+                            streaming_msg = cl.Message(content="")
+                            await streaming_msg.send()
+                        streamed_text += tok
+                        await streaming_msg.stream_token(tok)
+                        continue
+
                     if etype == "done":
                         if _status_step is not None:
                             _status_step.name = "✅ 完成"
@@ -386,7 +538,16 @@ async def on_message(msg: cl.Message):
         await cl.Message(content=f"❌ 连接后端异常：`{type(e).__name__}: {e}`").send()
         return
 
-    answer = final_answer or "*(空回答)*"
-    answer += _format_citations(final_citations)
     elements = _page_elements(final_pages)
-    await cl.Message(content=answer, elements=elements).send()
+    citations_md = _format_citations(final_citations)
+
+    if streaming_msg is not None:
+        # Tokens already on screen — append citations + attach page elements in place.
+        body = (final_answer or streamed_text) + citations_md
+        streaming_msg.content = body
+        if elements:
+            streaming_msg.elements = elements
+        await streaming_msg.update()
+    else:
+        answer = (final_answer or "*(空回答)*") + citations_md
+        await cl.Message(content=answer, elements=elements).send()

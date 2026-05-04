@@ -194,10 +194,16 @@ def _encode_via_service(image_paths: list[Path], colqwen_url: str) -> torch.Tens
 
 
 def _encode_via_local(image_paths: list[Path]) -> torch.Tensor:
-    """Encode pages using local ColQwen2 model."""
-    from ingestion.model_loader import encode_pages, load_model_and_processor
-    model, processor = load_model_and_processor()
-    return encode_pages(model, processor, image_paths)
+    """Encode pages using the local ColQwen2 model.
+
+    Reuses the singleton already loaded by `tools.colpali_tool` (eagerly
+    preloaded by `backend.server` at startup). Loading a second copy here
+    would OOM the 6GB GPU and waste ~60s reloading weights.
+    """
+    from ingestion.model_loader import encode_pages
+    from tools.colpali_tool import _ensure_model_loaded, _state
+    _ensure_model_loaded()
+    return encode_pages(_state["model"], _state["processor"], image_paths)
 
 
 def _push_to_qdrant(doc_id: str, embeddings: torch.Tensor,

@@ -53,3 +53,5 @@ class AgentState(TypedDict, total=False):
     citations: list[Citation]
 
     chat_history: list[dict]
+
+    doc_filter: Optional[list[str]]

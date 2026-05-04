@@ -30,6 +30,27 @@ def _load_doc_metadata() -> str:
     return "\n".join(lines)
 
 
+def _render_history(state: AgentState, max_chars_per_turn: int = 200) -> str:
+    """Render chat_history as compact bullet lines for the planner prompt.
+
+    Each entry is `{"role": "user"|"assistant", "content": str}`. Long
+    assistant answers are truncated — coreference resolution only needs the
+    entities mentioned, not the full citation list.
+    """
+    history = state.get("chat_history") or []
+    if not history:
+        return "(no prior turns)"
+    lines: list[str] = []
+    for turn in history:
+        role = turn.get("role", "?")
+        content = (turn.get("content") or "").strip().replace("\n", " ")
+        if len(content) > max_chars_per_turn:
+            content = content[:max_chars_per_turn] + "…"
+        prefix = "U" if role == "user" else "A"
+        lines.append(f"{prefix}: {content}")
+    return "\n".join(lines)
+
+
 def planner_node(state: AgentState) -> dict:
     if not has_llm_key():
         logger.warning("DEEPSEEK_API_KEY not set — planner falls back to single sub-task")
@@ -40,6 +61,7 @@ def planner_node(state: AgentState) -> dict:
         prompt = _PROMPT.format(
             query=state["query"],
             doc_metadata=_load_doc_metadata(),
+            chat_history=_render_history(state),
         )
         result: PlannerOutput = llm.invoke(prompt)
         plan = [SubTask(**item.model_dump()) for item in result.plan]

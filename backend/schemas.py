@@ -79,11 +79,15 @@ class UploadResponse(BaseModel):
 
 
 class UploadStatusOut(BaseModel):
-    upload_id: str
+    """Shape of each SSE frame emitted by GET /api/v1/upload/{id}/status.
+
+    `status` is the current pipeline stage emitted by run_upload_pipeline:
+    queued | save | pages | encode | encoding | index | qdrant | register | done | failed.
+    """
     doc_id: str
-    status: str  # "queued" | "encoding" | "ready" | "failed"
-    page_count: int = 0
+    status: str
     message: str = ""
+    pct: float = 0.0
 
 
 class DocumentOut(BaseModel):

@@ -21,7 +21,7 @@ def executor_node(state: AgentState) -> dict:
     sub_task = plan[cursor]
     if sub_task.expected_output_schema == "number":
         return _run_calculation(sub_task, cursor)
-    return _run_retrieval(sub_task, cursor)
+    return _run_retrieval(sub_task, cursor, state.get("doc_filter"))
 
 
 def _run_calculation(sub_task, cursor: int) -> dict:
@@ -34,8 +34,13 @@ def _run_calculation(sub_task, cursor: int) -> dict:
     return {"computed_values": [cv], "plan_cursor": cursor + 1}
 
 
-def _run_retrieval(sub_task, cursor: int) -> dict:
-    doc_filter = [sub_task.target_doc] if sub_task.target_doc else None
+def _run_retrieval(sub_task, cursor: int, session_doc_filter: list[str] | None) -> dict:
+    if sub_task.target_doc:
+        doc_filter = [sub_task.target_doc]
+    elif session_doc_filter:
+        doc_filter = session_doc_filter
+    else:
+        doc_filter = None
     hits = colpali_retrieve(sub_task.sub_query, top_k=TOP_K, doc_filter=doc_filter)
 
     if not hits:
