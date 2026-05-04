@@ -362,6 +362,7 @@ async def on_message(msg: cl.Message):
                         final_answer = data.get("answer", "")
                         final_citations = data.get("citations", [])
                         final_pages = data.get("retrieved_pages", [])
+                        final_grounding_score = data.get("grounding_score", 1.0)
                         new_conv_id = data.get("conv_id")
                         if new_conv_id:
                             cl.user_session.set("conv_id", new_conv_id)

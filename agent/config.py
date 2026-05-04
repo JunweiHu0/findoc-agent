@@ -13,6 +13,7 @@ with open(ROOT / "config.yaml", "r", encoding="utf-8") as f:
 
 
 def _abs(rel: str) -> Path:
+    """Resolve a relative config path against the project root."""
     p = Path(rel)
     return p if p.is_absolute() else ROOT / p
 

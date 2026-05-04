@@ -1,3 +1,9 @@
+"""Synthesizer node — composes the final answer from accumulated evidence.
+
+Streams tokens via a module-level hook (P16) when registered by the backend.
+Falls back to invoke() when no hook is set or when the stream is empty.
+"""
+
 from __future__ import annotations
 
 from loguru import logger
@@ -16,11 +22,13 @@ _token_hook: "callable | None" = None
 
 
 def set_token_hook(hook: "callable | None") -> None:
+    """Register a streaming token callback (called by backend/server.py)."""
     global _token_hook
     _token_hook = hook
 
 
 def _push_token(token: str) -> None:
+    """Push a single token chunk to the registered hook, swallowing errors."""
     if _token_hook and token:
         try:
             _token_hook(token)
@@ -29,6 +37,11 @@ def _push_token(token: str) -> None:
 
 
 def synthesizer_node(state: AgentState) -> dict:
+    """Generate the final answer with citations from extracted facts and computed values.
+
+    When a token hook is registered, streams via llm.stream() for real-time SSE;
+    otherwise falls back to a single invoke().
+    """
     facts = state.get("extracted_facts") or []
     cvs = state.get("computed_values") or []
     citations = _dedupe_citations(facts)
@@ -67,6 +80,7 @@ def synthesizer_node(state: AgentState) -> dict:
 
 
 def _dedupe_citations(facts) -> list[Citation]:
+    """Build a deduplicated list of Citations from extracted facts."""
     seen: set[tuple[str, int]] = set()
     out: list[Citation] = []
     for f in facts:
@@ -79,6 +93,7 @@ def _dedupe_citations(facts) -> list[Citation]:
 
 
 def _render_evidence(facts, cvs) -> str:
+    """Format facts and computed values as bullet lines for the LLM prompt."""
     if not facts and not cvs:
         return "(no evidence)"
     lines = []
@@ -90,6 +105,7 @@ def _render_evidence(facts, cvs) -> str:
 
 
 def _stub_answer(state: AgentState, facts, cvs) -> str:
+    """Build a stub answer from raw evidence when the LLM is unavailable."""
     parts = [f"Q: {state['query']}", ""]
     if not facts and not cvs:
         parts.append("[stub] no evidence collected")

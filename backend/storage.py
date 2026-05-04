@@ -63,6 +63,24 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
                 CHECK(status IN ('queued','encoding','ready','failed')),
             created_at REAL NOT NULL
         );
+
+        -- P25: cross-turn fact memory
+        CREATE TABLE IF NOT EXISTS conv_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            entity TEXT DEFAULT '',
+            period TEXT DEFAULT '',
+            metric TEXT DEFAULT '',
+            value REAL,
+            unit TEXT DEFAULT '',
+            source_doc TEXT NOT NULL DEFAULT '',
+            source_page INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL DEFAULT '',
+            created_at REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_conv_facts_lookup
+            ON conv_facts(conv_id, entity, period, metric);
         """
     )
     conn.commit()
@@ -295,6 +313,69 @@ def delete_document(doc_id: str) -> bool:
         affected = conn.total_changes
         conn.close()
     return affected > 0
+
+
+# ---------------------------------------------------------------------------
+# P25: Cross-turn fact memory
+# ---------------------------------------------------------------------------
+
+def save_conv_facts(conv_id: str, facts: list[dict]) -> None:
+    """Persist structured facts from the current turn for cross-turn reuse.
+
+    Each fact dict is a pydantic Fact.model_dump() or equivalent dict with
+    entity/period/metric/value/unit/source_doc/source_page/text fields.
+    Only facts with at least one structured field are persisted.
+    """
+    if not conv_id or not facts:
+        return
+    now = time.time()
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        for f in facts:
+            entity = (f.get("entity") or "").strip()
+            period = (f.get("period") or "").strip()
+            metric = (f.get("metric") or "").strip()
+            # Skip fully unstructured facts — no lookup key to reuse
+            if not entity and not period and not metric:
+                continue
+            conn.execute(
+                "INSERT OR REPLACE INTO conv_facts "
+                "(conv_id, entity, period, metric, value, unit, source_doc, source_page, text, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    conv_id, entity, period, metric,
+                    f.get("value"), (f.get("unit") or ""),
+                    f.get("source_doc", ""), f.get("source_page", 0),
+                    f.get("text", ""), now,
+                ),
+            )
+        conn.commit()
+        conn.close()
+    logger.debug(f"Saved {len(facts)} facts for conv {conv_id}")
+
+
+def load_conv_facts(conv_id: str) -> list[dict]:
+    """Load all structured facts from prior turns of this conversation."""
+    if not conv_id:
+        return []
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        rows = conn.execute(
+            "SELECT entity, period, metric, value, unit, source_doc, source_page, text "
+            "FROM conv_facts WHERE conv_id = ? ORDER BY created_at",
+            (conv_id,),
+        ).fetchall()
+        conn.close()
+    return [
+        {
+            "entity": r[0], "period": r[1], "metric": r[2],
+            "value": r[3], "unit": r[4],
+            "source_doc": r[5], "source_page": r[6], "text": r[7],
+        }
+        for r in rows
+    ]
 
 
 # ---------------------------------------------------------------------------

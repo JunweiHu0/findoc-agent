@@ -5,6 +5,9 @@ Decompose the user question into an ordered list of sub-tasks. Each sub-task mus
 Available documents (with metadata):
 {doc_metadata}
 
+Available tools (each sub-task can call one or more):
+{available_tools}
+
 Recent conversation (most-recent last; may be empty):
 {chat_history}
 
@@ -23,15 +26,27 @@ Return ONLY valid JSON of the form:
     {{
       "sub_query": "...",
       "target_doc": "doc_id or null",
-      "expected_output_schema": "number | text | table"
+      "expected_output_schema": "number | text | table",
+      "tool_calls": [
+        {{"tool": "tool_name", "args": {{...}}}}
+      ]
     }}
-  ]
+  ],
+  "query_class": "single_fact | cross_doc_compare | multi_step_calc | trend_analysis"
 }}
 
 Rules:
 - Keep the plan minimal. Do not invent sub-tasks the question does not require.
 - If the question is a single-fact lookup, return a single-element plan.
 - target_doc MUST be one of the doc_id values listed above, or null. Never invent a doc_id.
+- When tool_calls is non-empty, it takes priority and the executor will dispatch each tool call.
+- Prefer using explicit tool_calls (e.g. retrieve_pages → read_page_with_vlm) over expected_output_schema when the tool fits naturally.
+
+Query classification (set query_class):
+- "single_fact": one number or fact from one doc
+- "cross_doc_compare": compare the same metric across 2+ docs
+- "multi_step_calc": need text retrieval to get figures, then a compute step
+- "trend_analysis": same metric over multiple years / periods
 
 Schema discipline (strict):
 - "text"   → retrieval + page reading. sub_query is a natural-language question. USE THIS for every fact lookup, including when a percentage or ratio appears verbatim on a page.

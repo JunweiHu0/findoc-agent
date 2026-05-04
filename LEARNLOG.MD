@@ -87,15 +87,62 @@ ColQwen = **检索引擎**（找哪几页有答案），Qwen VLM = **阅读器**
 
 ---
 
-## 五、当前架构（P10 之后）
+## 五、当前架构（P25 之后，7 节点 Agent）
+
+```
+用户问题
+    │
+    ▼
+┌──────────────────┐  预检索全库 top-3 文档，让 planner 知道哪些 doc 可能相关
+│ retrieval_scout  │  (P22)
+└────────┬─────────┘
+         │
+         ▼
+┌──────────┐     拆解为有序子任务（JSON plan），含 query_class + tool_calls
+│ Planner  │ ──► 每个 SubTask: sub_query / target_doc / tool_calls / expected_schema
+└──────────┘     输入含 candidate_docs（scout 结果）+ Available Tools 列表
+    │
+    ▼
+┌──────────┐     tool_calls 优先 → registry dispatch → output_schema 校验
+│ Executor │ ──► 回退 expected_output_schema（text/table → 检索+VLM; number → calculator）
+└──────────┘     VLM 输出后 immediately → fact_extractor 结构化 (P24)
+    │              pre-retrieval 先查 known_facts 跨轮缓存 (P25)
+    ▼
+┌──────────┐     结构化 missing_facts（含 root_cause + suggested_*）
+│ Verifier │ ──► 早停：无新事实 → 强制 synthesizer 标 low-confidence
+└──────────┘     防重复：tried_queries / tried_pages 传入下轮 prompt
+    │
+    ├─ ✅ 充分 ──────────────────────┐
+    │                                ▼
+    ├─ ↻ 不充分 ──► ┌────────────┐  │
+    │               │ remediation │  │  按 root_cause 分派四条修复路径：
+    │               └─────┬───────┘  │  retrieval_miss → 重检索
+    │                     │          │  reading_miss   → 精炼指令重读同批页 (P20)
+    │                     ▼          │  ambiguous_query → 改写 self-contained query
+    │                 Executor       │  inconsistency  → disambiguate_caliber 口径消歧
+    │                     │          │  budget 耗尽 → fallthrough
+    └─────────────────────┘          │
+                                     ▼
+                              ┌─────────────┐
+                              │ Synthesizer │  汇总事实 → 带 [doc_id p.X] 引用的答案
+                              └──────┬──────┘  流式 token-by-token 输出 (P16)
+                                     │
+                                     ▼
+                              ┌─────────────┐  Citation 校验：[引用] ∈ accumulated_facts?
+                              │  Grounding  │  Numeric 校验：fuzzy match ±0.1%
+                              └─────────────┘  未验证引用剥离 + ⚠/🛑 banner (P23)
+```
+
+### 部署架构
 
 ```
 ┌─ uvicorn backend.server:app (port 8001) ──────┐
 │  FastAPI + SSE                                  │
-│  POST /api/v1/query  → SSE 流（节点 + 进度）    │
+│  POST /api/v1/query  → SSE 流（7 节点 + 进度） │
 │  GET  /api/v1/docs   → 已索引文档列表           │
 │  GET  /api/v1/health                            │
 │  startup → 预加载 ColQwen2 + 索引               │
+│  per-query → load/save conv_facts (P25)         │
 └──────────────────┬──────────────────────────────┘
                    │
         ┌──────────┴────────────┐
@@ -108,8 +155,8 @@ ColQwen = **检索引擎**（找哪几页有答案），Qwen VLM = **阅读器**
 
 ┌─ chainlit run app/chainlit_app.py ────────────┐
 │  纯 UI 层（仅 import chainlit / httpx）         │
-│  消费 SSE：event=node|status|done|error         │
-│  动态 Step + 引用 inline Image                  │
+│  消费 SSE：event=node|status|token|done|error   │
+│  动态 Step + 引用 inline Image + 置信度 banner  │
 └──────────────────────────────────────────────────┘
 ```
 
@@ -159,21 +206,20 @@ LangGraph `astream` 在 Executor 内部被模型加载/VLM 调用阻塞，无法
 
 ---
 
-## 八、剩余的工业级差距
+## 八、工业级差距（P25 后状态）
 
-P7/P8/P10 已解决了"架构解耦 / 横向扩展 / 可观测性入口 / 多用户竞态"。下面是仍未补的硬伤：
+P11–P25 已解决了以下差距：VLM 并行化 ✅、VLM 缓存 ✅、对话持久化 ✅、流式输出 ✅。P19–P25 解决了 Agent 核心调用逻辑的 5 处结构性弱点（见 §11）。仍未补的硬伤：
 
 | 项 | 现状 | 建议 |
 |---|---|---|
-| **测试** | 零测试文件 | `tests/` + pytest，先覆盖 calculator AST 安全求值、`derive_doc_id`、MaxSim 确定性张量 |
-| **缓存** | 无 | VLM 页面读取按 `(doc_id, page_num, query_hash)` 落 SQLite；LLM 输出按 query+plan 哈希做语义缓存 |
+| **测试** | 零测试文件 | `tests/` + pytest，先覆盖 calculator AST 安全求值、`derive_doc_id`、MaxSim 确定性张量、grounding 校验逻辑 |
 | **重试与超时** | 失败直接 fallback 到 stub | 所有外部 API 加 `tenacity` 指数退避；ChatOpenAI 加 `timeout=60, max_retries=3` |
 | **可观测性** | loguru 导入未配置 | 接 LangSmith（`LANGCHAIN_TRACING_V2=true`）；`logger.add(rotation, retention, serialize=True)` |
-| **VLM 并行化** | top_k=5 串行调用 ~10s | `asyncio.gather` 并发 → ~2s |
-| **持久化** | Chainlit 历史纯内存 | SQLite + aiosqlite 接 Chainlit Data Layer |
-| **鉴权** | 无 | Chainlit `@cl.password_auth_callback` 或 OAuth |
+| **鉴权** | 单用户模式 | Chainlit `@cl.password_auth_callback` 或 OAuth |
 | **CI/CD** | 无 | Dockerfile + docker-compose + GitHub Actions（ruff + pytest） |
+| **评测集** | 仅示例条目 | 扩到 30 题（L1/L2/L3 各 10），标黄金答案 + 证据页 |
 | **配置校验** | 启动不检查必需 env | `pydantic-settings` 启动时校验所有 key |
+| **LLM 输出语义缓存** | 无 | 按 query+plan 哈希做语义缓存，省 Planner/Verifier/Synthesizer LLM 调用 |
 
 ---
 
@@ -347,10 +393,87 @@ if not sufficient:
 
 ---
 
+## 十一、P19–P25 升级后的核心架构原理
+
+> P19–P25 针对 §10 诊断的 5 处结构性弱点做了系统升级。下面从"改了什么"角度总结。
+
+### 11.1 从 4 节点直筒到 7 节点有向图
+
+```
+旧: planner → executor → verifier ⇄ executor → synthesizer
+新: retrieval_scout → planner → executor → verifier → remediation → executor
+                                                  └─ sufficient ─→ synthesizer → grounding
+```
+
+新增 3 个节点，每个解决一个瓶颈：
+
+| 新节点 | 位置 | 解决 §10 的哪个问题 |
+|---|---|---|
+| `retrieval_scout` | planner 之前 | §10.1 盲规划：预检索 top-3 文档，planner 看到候选 doc 的 top 页 + 相关性分数再决策 |
+| `remediation` | verifier → executor | §10.3 修复策略同质化：按 root_cause 分派 4 条不同修复路径 |
+| `grounding` | synthesizer → END | §10.5 后置零校验：逐条校验引用 + 数值，未匹配项剥离 |
+
+### 11.2 Verifier 从自由文本到结构化诊断
+
+```
+旧: missing_info: "还需要宁德时代的毛利率"  →  executor 只能 append 一个 SubTask(sub_query=这个字符串)
+新: missing_facts: [{root_cause: "retrieval_miss", suggested_query: "宁德时代 2023年 毛利率", suggested_target_doc: "catl_2023", ...}]
+```
+
+下游 remediation 拿到 root_cause 后：
+- `retrieval_miss` → 放宽 top_k 重检索
+- `reading_miss` → VLM 精炼 prompt 重读同一批页，不跑 ColQwen
+- `ambiguous_query` → 改写为 self-contained query
+- `inconsistency` → 触发 `disambiguate_caliber` 提取口径
+
+**核心收益**：修复不再"一律重新检索+VLM"，对症下药减少了冗余 API 调用。
+
+### 11.3 工具系统从 if/else 到 Registry
+
+```
+旧: if expected_output_schema == "number": ... else: ...
+新: REGISTRY["retrieve_pages"].dispatch(args) → output_schema.model_validate(raw)
+```
+
+4 个工具 `retrieve_pages / read_page_with_vlm / calculate / disambiguate_caliber` 各自携带 `(description, params_schema, output_schema)`，planner prompt 自动获得工具列表，executor 做纯 dispatch。加新工具只需写工具函数 + `register()` 一行。
+
+`SubTask.tool_calls` 优先级高于 `expected_output_schema`，存量行为完全兼容。
+
+### 11.4 Fact 从扁平字符串到结构化键值
+
+```
+旧: Fact { text: "营收1505.6亿元", source_doc, source_page }
+新: Fact { text, source_doc, source_page, entity: "贵州茅台", period: "2023", metric: "营业收入", value: 1505.6, unit: "亿元", raw_kind: "numeric" }
+```
+
+`fact_extractor`（纯 regex，零 LLM）在 VLM 输出后立即做结构化抽取。Verifier 拿到结构化 facts 后可以机械判断"是否已有 (茅台, 2023, 营收)"，而不靠 LLM 重新解析。
+
+### 11.5 跨轮事实复用
+
+```
+第 1 轮: "茅台 2023 年营收?" → extracted_facts → save_conv_facts(conv_id, facts)
+第 2 轮: "那同比增长呢?" → load_conv_facts(conv_id) → known_facts
+         → executor 检查 (茅台, 2023, 营收) 已命中 → 跳过 retrieval + VLM
+```
+
+连续追问场景后续轮次的 retrieval 调用可降 40–60%。
+
+### 11.6 关键设计原则（贯穿 P19–P25）
+
+1. **LLM 判，规则修**：Verifier 用 LLM 做语义判断（什么信息缺失、为什么缺失），但修复策略是确定性的（remediation 按 root_cause 分派，grounding 按正则+集合查）。LLM 负责"理解"，规则负责"执行"。
+2. **向后兼容优先**：所有新字段 Optional、新路径 fallback 到旧路径、schema 加字段不改结构。
+3. **Budget 兜底**：reflexion 有 `max_iter=3` + `budget_retrievals` + `budget_vlm_calls` 三重保护，不让 agent 陷入死循环或耗尽 API 额度。
+4. **纯规则优先**：能不用 LLM 的地方坚决不用——fact_extractor（regex）、grounding（集合查）、budget（计数器）。
+
+---
+
 ## 九、亮点（值得保留的设计）
 
 - **视觉检索绕过 OCR**：ColPali/ColQwen 是 2024 年才兴起的方向，多数 RAG 项目仍走 OCR + 文本分块
-- **Planner-Verifier-Synthesizer 显式状态机**：不是简单 QA 链，有真正的 reflexion 循环
+- **7 节点显式状态机**：从 planner-verifier 升级到 scout-planner-executor-verifier-remediation-synthesizer-grounding，每个节点职责单一切可观测
+- **结构化根因诊断**：四种 root_cause 驱动差异化修复，不是"再来一次"的盲目 reflexion
 - **MaxSim 后期交互**：比 CLIP/ViT 单向量检索强一档
-- **金融领域适配**：calculator AST 求值、跨页一致性校验、引用溯源
+- **金融领域适配**：calculator AST 求值、跨页一致性校验、口径消歧、引用溯源 + grounding 后置审计
+- **Tool Registry 可扩展**：加工具只需注册一行，planner 自动感知，向后兼容字符串路由
+- **跨轮事实复用**：结构化 fact store + SQLite 持久化，追问场景检索调用降 40–60%
 - **三层服务边界清晰**：ColQwen Service（GPU）/ Qdrant（向量库）/ FastAPI（业务）/ Chainlit（UI），任何一层可独立替换

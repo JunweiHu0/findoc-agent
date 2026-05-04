@@ -48,6 +48,12 @@ _GRAPH = compile_graph()
 # Node summary helpers (moved here from chainlit_app.py)
 # ---------------------------------------------------------------------------
 def _summarize_node(node: str, delta: dict[str, Any]) -> str:
+    if node == "retrieval_scout":
+        candidates = delta.get("scout_candidates") or []
+        if not candidates:
+            return "未找到候选文档"
+        top = candidates[0]
+        return f"Top-{len(candidates)}候选: {top.get('doc_id','?')}"
     if node == "planner":
         plan = delta.get("plan") or []
         if not plan:
@@ -60,15 +66,35 @@ def _summarize_node(node: str, delta: dict[str, Any]) -> str:
         cvs = len(delta.get("computed_values") or [])
         return f"检索{pages}页 · 抽取{facts}事实 · 计算{cvs}"
     if node == "verifier":
-        return "✅ 充分" if delta.get("is_sufficient") else "↻ 触发再检索"
+        confidence = delta.get("confidence", 0.5)
+        if delta.get("is_sufficient"):
+            return f"✅ 充分 (置信{confidence:.0%})"
+        missing = len(delta.get("missing_facts") or [])
+        return f"↻ 缺{missing}项 (置信{confidence:.0%})"
+    if node == "remediation":
+        return "🔧 差异化修复"
     if node == "synthesizer":
         ans = delta.get("answer") or ""
         cites = len(delta.get("citations") or [])
         return f"生成答案({len(ans)}字符 · {cites}引用)"
+    if node == "grounding":
+        score = delta.get("grounding_score", 1.0)
+        unverified = len(delta.get("unverified_claims") or [])
+        if unverified == 0:
+            return "✅ 校验通过"
+        return f"⚠ 校验: {unverified}项未匹配"
     return "完成"
 
 
 def _format_delta(node: str, delta: dict[str, Any]) -> str:
+    if node == "retrieval_scout":
+        candidates = delta.get("scout_candidates") or []
+        if not candidates:
+            return "*(未找到候选文档 — planner 将使用 doc_metadata)*"
+        lines = [f"**检索前探查** — Top-{len(candidates)} 候选文档\n"]
+        for i, c in enumerate(candidates, 1):
+            lines.append(f"{i}. `{c.get('doc_id','?')}` 最佳页 p.{c.get('top_page_num','?')}  score={c.get('top_score',0):.4f}")
+        return "\n".join(lines)
     if node == "planner":
         plan = delta.get("plan") or []
         if not plan:
@@ -137,6 +163,7 @@ def _initial_state(
     query: str,
     doc_filter: list[str] | None = None,
     chat_history: list[dict] | None = None,
+    known_facts: list[dict] | None = None,
 ) -> dict[str, Any]:
     return {
         "query": query,
@@ -148,6 +175,16 @@ def _initial_state(
         "computed_values": [],
         "doc_filter": doc_filter,
         "chat_history": chat_history or [],
+        "tried_queries": [],
+        "tried_pages": [],
+        "missing_facts": [],
+        "budget_retrievals": 10,
+        "budget_vlm_calls": 20,
+        "scout_candidates": [],
+        "unverified_claims": [],
+        "grounding_score": 0.0,
+        "fact_index": {},
+        "known_facts": known_facts or [],
     }
 
 
@@ -310,7 +347,9 @@ async def query(req: QueryRequest):
 
     async def event_stream():
         history = _load_chat_history(conv_id)
-        state = _initial_state(req.query, req.doc_filter, history)
+        # P25: load cross-turn facts
+        known_facts = storage.load_conv_facts(conv_id) if conv_id else []
+        state = _initial_state(req.query, req.doc_filter, history, known_facts)
         thread = threading.Thread(target=_run_agent_sync, args=(state,), daemon=True)
         thread.start()
 
@@ -379,6 +418,8 @@ async def query(req: QueryRequest):
         answer = (accumulated.get("answer") or "").strip()
         citations = accumulated.get("citations") or []
         pages = accumulated.get("retrieved_pages") or []
+        grounding_score = accumulated.get("grounding_score", 1.0)
+        unverified_claims = accumulated.get("unverified_claims") or []
 
         # Persist to conversation history
         try:
@@ -391,6 +432,14 @@ async def query(req: QueryRequest):
         except Exception as e:
             logger.warning(f"Failed to persist messages for conv {conv_id}: {e}")
 
+        # P25: persist structured facts for cross-turn reuse
+        try:
+            extracted = accumulated.get("extracted_facts") or []
+            fact_dicts = [f.model_dump() if hasattr(f, "model_dump") else f for f in extracted]
+            storage.save_conv_facts(conv_id, fact_dicts)
+        except Exception as e:
+            logger.warning(f"Failed to save conv_facts for {conv_id}: {e}")
+
         # P17: fire-and-forget auto-title once we have a (user, assistant) pair.
         asyncio.create_task(_maybe_auto_title(conv_id, req.query, answer))
 
@@ -400,6 +449,8 @@ async def query(req: QueryRequest):
             "answer": answer,
             "citations": [_citation_to_out(c).model_dump() for c in citations],
             "retrieved_pages": [_page_hit_to_out(p).model_dump() for p in pages],
+            "grounding_score": grounding_score,
+            "unverified_claims": unverified_claims,
         }, ensure_ascii=False)
         yield f"event: done\ndata: {done}\n\n"
 
