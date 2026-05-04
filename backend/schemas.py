@@ -1,5 +1,7 @@
 """Pydantic models for FinDoc Agent API."""
 
+from typing import Optional
+
 from pydantic import BaseModel
 
 
@@ -96,3 +98,6 @@ class DocumentOut(BaseModel):
     page_count: int
     status: str
     created_at: float
+    # Inline base64 thumbnail (data URL). None when the doc has no rendered
+    # page image — the frontend renders a plain "no image" placeholder.
+    thumbnail: Optional[str] = None

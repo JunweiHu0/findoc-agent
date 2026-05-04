@@ -136,3 +136,610 @@ img[class*="inline-image"] {
   pre { background: #1c1917 !important; }
   pre code { color: #e7e5e4 !important; }
 }
+
+/* ============================================================
+   Doc Sidebar — right-side document panel (Claude.ai-inspired)
+   ============================================================ */
+
+/* Toggle pill button — sits in the top-right of the viewport. The pill form
+   is wider than Chainlit's icon-buttons so it doesn't visually clash with
+   them, and it carries its own label so the affordance is obvious. */
+.findoc-sidebar-toggle {
+  position: fixed;
+  top: 12px;
+  /* Reserve space on the right for Chainlit's own header buttons
+     (help, user, theme-toggle, etc.) so this pill doesn't overlap them. */
+  right: 220px;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  height: 34px;
+  padding: 0 12px 0 10px;
+  border-radius: 999px;
+  border: 1px solid #e7e5e4;
+  background: #ffffff;
+  color: #57534e;
+  font-size: 13px;
+  font-weight: 500;
+  font-family: inherit;
+  cursor: pointer;
+  z-index: 2147483647;
+  transition: background 150ms ease, border-color 150ms ease, color 150ms ease, box-shadow 150ms ease;
+  box-shadow: 0 1px 2px rgba(28, 25, 23, 0.04);
+}
+.findoc-sidebar-toggle:hover {
+  background: #fffbeb;
+  border-color: #fcd34d;
+  color: #b45309;
+  box-shadow: 0 2px 8px rgba(217, 119, 6, 0.14);
+}
+.findoc-sidebar-toggle .findoc-toggle-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.findoc-sidebar-toggle .findoc-toggle-icon svg {
+  width: 16px;
+  height: 16px;
+}
+.findoc-sidebar-toggle .findoc-toggle-label {
+  letter-spacing: 0.01em;
+}
+.findoc-sidebar-toggle .findoc-toggle-count {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 18px;
+  height: 18px;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: #f5f5f4;
+  color: #78716c;
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1;
+}
+.findoc-sidebar-toggle.has-docs .findoc-toggle-count {
+  background: #fde68a;
+  color: #92400e;
+}
+
+/* Overlay (dimmed page behind the panel) */
+.findoc-sidebar-overlay {
+  position: fixed;
+  inset: 0;
+  background: rgba(28, 25, 23, 0.32);
+  z-index: 2147483645;
+  opacity: 0;
+  pointer-events: none;
+  transition: opacity 240ms ease;
+}
+.findoc-sidebar-overlay.open {
+  opacity: 1;
+  pointer-events: auto;
+}
+
+/* Panel */
+.findoc-sidebar {
+  position: fixed;
+  top: 0;
+  right: 0;
+  width: 380px;
+  max-width: 92vw;
+  height: 100vh;
+  background: #ffffff;
+  border-left: 1px solid #e7e5e4;
+  z-index: 2147483646;
+  display: flex;
+  flex-direction: column;
+  transform: translateX(100%);
+  transition: transform 300ms cubic-bezier(0.23, 1, 0.32, 1);
+  box-shadow: -8px 0 28px rgba(28, 25, 23, 0.08);
+}
+.findoc-sidebar.open {
+  transform: translateX(0);
+}
+
+/* Header */
+.findoc-sidebar-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 16px 18px;
+  border-bottom: 1px solid #e7e5e4;
+  flex-shrink: 0;
+}
+.findoc-sidebar-title {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 0.98rem;
+  font-weight: 700;
+  color: #1c1917;
+}
+.findoc-sidebar-title-text {
+  color: #1c1917;
+  font-weight: 700;
+  letter-spacing: 0.01em;
+}
+.findoc-sidebar-title-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border-radius: 8px;
+  background: var(--findoc-accent-soft);
+  color: var(--findoc-accent);
+}
+.findoc-sidebar-title-icon svg {
+  width: 15px;
+  height: 15px;
+}
+.findoc-sidebar-count {
+  font-size: 0.72rem;
+  font-weight: 600;
+  color: #78716c;
+  background: #f5f5f4;
+  padding: 1px 9px;
+  border-radius: 999px;
+  margin-left: 2px;
+}
+.findoc-sidebar-header-actions {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+}
+.findoc-sidebar-iconbtn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 30px;
+  height: 30px;
+  border: 1px solid transparent;
+  border-radius: 8px;
+  background: transparent;
+  color: #78716c;
+  cursor: pointer;
+  transition: background 130ms ease, color 130ms ease, border-color 130ms ease;
+}
+.findoc-sidebar-iconbtn:hover {
+  background: #f5f5f4;
+  color: #292524;
+  border-color: #e7e5e4;
+}
+.findoc-sidebar-iconbtn.spinning svg {
+  animation: findoc-spin 700ms linear;
+}
+
+/* Drop zone */
+.findoc-sidebar-dropzone {
+  margin: 12px 16px 0;
+  border: 1px dashed #e7e5e4;
+  border-radius: 10px;
+  background: #fafaf9;
+  padding: 14px 16px;
+  text-align: center;
+  cursor: pointer;
+  transition: background 140ms ease, border-color 140ms ease;
+}
+.findoc-sidebar-dropzone:hover,
+.findoc-sidebar-dropzone.dragover {
+  border-color: var(--findoc-accent);
+  background: #fffbeb;
+}
+.findoc-dropzone-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  color: var(--findoc-accent);
+  margin-bottom: 4px;
+}
+.findoc-dropzone-text {
+  font-size: 0.82rem;
+  color: #44403c;
+  margin-bottom: 2px;
+}
+.findoc-dropzone-link {
+  color: var(--findoc-accent);
+  font-weight: 600;
+}
+.findoc-dropzone-hint {
+  font-size: 0.7rem;
+  color: #a8a29e;
+}
+
+/* Body */
+.findoc-sidebar-body {
+  flex: 1;
+  overflow-y: auto;
+  padding: 12px 16px 16px;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+.findoc-sidebar-body::-webkit-scrollbar {
+  width: 5px;
+}
+.findoc-sidebar-body::-webkit-scrollbar-thumb {
+  background: #d6d3d1;
+  border-radius: 6px;
+}
+
+/* Doc card */
+.findoc-doc-card {
+  background: #ffffff;
+  border: 1px solid #e7e5e4;
+  border-radius: 10px;
+  overflow: hidden;
+  transition: border-color 140ms ease, box-shadow 140ms ease, transform 140ms ease;
+}
+.findoc-doc-card:hover {
+  border-color: #fde68a;
+  box-shadow: 0 4px 14px rgba(28, 25, 23, 0.06);
+}
+.findoc-doc-card.uploading {
+  border-style: dashed;
+  border-color: var(--findoc-accent);
+}
+.findoc-doc-card.failed {
+  border-color: #fecaca;
+}
+
+.findoc-doc-preview {
+  position: relative;
+  width: 100%;
+  height: 150px;
+  background: #f5f5f4;
+  overflow: hidden;
+  border-bottom: 1px solid #e7e5e4;
+}
+.findoc-doc-preview img {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  object-position: top;
+  display: block;
+}
+.findoc-doc-preview-fallback {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 100%;
+  height: 100%;
+  background: repeating-linear-gradient(
+    45deg,
+    #fafaf9,
+    #fafaf9 8px,
+    #f5f5f4 8px,
+    #f5f5f4 16px
+  );
+}
+.findoc-doc-preview-noimage {
+  font-size: 0.78rem;
+  font-weight: 500;
+  color: #a8a29e;
+  letter-spacing: 0.04em;
+  background: #ffffff;
+  padding: 4px 12px;
+  border-radius: 999px;
+  border: 1px solid #e7e5e4;
+}
+/* Legacy classes still referenced by upload-progress placeholder cards */
+.findoc-doc-preview-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+}
+.findoc-doc-preview-icon svg {
+  width: 28px;
+  height: 28px;
+  opacity: 0.6;
+  color: #a8a29e;
+}
+.findoc-doc-preview-ext {
+  font-size: 0.66rem;
+  font-weight: 700;
+  letter-spacing: 0.06em;
+  color: #78716c;
+  background: #ffffff;
+  padding: 2px 7px;
+  border-radius: 4px;
+  border: 1px solid #e7e5e4;
+  margin-top: 4px;
+}
+
+/* Status pill — overlaid on top-right of preview */
+.findoc-doc-status {
+  position: absolute;
+  top: 8px;
+  right: 8px;
+  display: inline-flex;
+  align-items: center;
+  font-size: 0.68rem;
+  font-weight: 600;
+  padding: 2px 8px;
+  border-radius: 999px;
+  backdrop-filter: blur(6px);
+  -webkit-backdrop-filter: blur(6px);
+}
+.findoc-doc-status.ready {
+  background: rgba(220, 252, 231, 0.92);
+  color: #166534;
+}
+.findoc-doc-status.failed {
+  background: rgba(254, 226, 226, 0.92);
+  color: #991b1b;
+}
+.findoc-doc-status.encoding,
+.findoc-doc-status.queued {
+  background: rgba(254, 243, 199, 0.92);
+  color: #92400e;
+}
+
+.findoc-doc-body {
+  padding: 12px 14px 14px;
+}
+.findoc-doc-name {
+  font-size: 0.86rem;
+  font-weight: 600;
+  color: #292524;
+  margin-bottom: 6px;
+  line-height: 1.35;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  word-break: break-all;
+}
+.findoc-doc-meta {
+  display: flex;
+  gap: 12px;
+  font-size: 0.72rem;
+  color: #78716c;
+  margin-bottom: 10px;
+}
+.findoc-doc-meta span {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+}
+
+/* Upload progress (used in placeholder card) */
+.findoc-doc-progress {
+  height: 4px;
+  background: #f5f5f4;
+  border-radius: 999px;
+  overflow: hidden;
+  margin-bottom: 6px;
+}
+.findoc-doc-progress-bar {
+  height: 100%;
+  width: 5%;
+  background: var(--findoc-accent);
+  border-radius: 999px;
+  transition: width 200ms ease;
+}
+.findoc-doc-progress-msg {
+  font-size: 0.72rem;
+  color: #78716c;
+}
+
+/* Per-card actions */
+.findoc-doc-actions {
+  display: flex;
+  gap: 6px;
+}
+.findoc-doc-action {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  flex: 1;
+  justify-content: center;
+  padding: 6px 8px;
+  font-size: 0.74rem;
+  font-weight: 500;
+  font-family: inherit;
+  border-radius: 7px;
+  border: 1px solid #e7e5e4;
+  background: #ffffff;
+  color: #57534e;
+  cursor: pointer;
+  transition: background 130ms ease, border-color 130ms ease, color 130ms ease;
+}
+.findoc-doc-action:hover {
+  background: #fafaf9;
+  border-color: #d6d3d1;
+  color: #292524;
+}
+.findoc-doc-action.danger:hover {
+  background: #fef2f2;
+  border-color: #fecaca;
+  color: #dc2626;
+}
+
+/* Empty state */
+.findoc-sidebar-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 36px 20px;
+  text-align: center;
+  color: #a8a29e;
+}
+.findoc-empty-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 56px;
+  height: 56px;
+  border-radius: 14px;
+  background: #f5f5f4;
+  margin-bottom: 12px;
+  color: #a8a29e;
+}
+.findoc-empty-icon svg {
+  width: 26px;
+  height: 26px;
+}
+.findoc-empty-title {
+  font-size: 0.9rem;
+  font-weight: 600;
+  color: #57534e;
+  margin: 0 0 6px;
+}
+.findoc-empty-hint {
+  font-size: 0.76rem;
+  color: #a8a29e;
+  margin: 0;
+  line-height: 1.55;
+}
+
+/* Spinner / shimmer */
+@keyframes findoc-spin {
+  from { transform: rotate(0deg); }
+  to   { transform: rotate(360deg); }
+}
+.findoc-spin {
+  animation: findoc-spin 1s linear infinite;
+}
+@keyframes findoc-shimmer {
+  0%   { background-position: -200% 0; }
+  100% { background-position: 200% 0; }
+}
+.findoc-skeleton {
+  background: linear-gradient(90deg, #f5f5f4 25%, #e7e5e4 50%, #f5f5f4 75%);
+  background-size: 200% 100%;
+  animation: findoc-shimmer 1.4s infinite;
+  border-radius: 6px;
+}
+
+/* ============================================================
+   Dark theme — sidebar
+   ============================================================ */
+@media (prefers-color-scheme: dark) {
+  .findoc-sidebar-toggle {
+    background: #1c1917;
+    border-color: #44403c;
+    color: #d6d3d1;
+  }
+  .findoc-sidebar-toggle:hover {
+    background: #292524;
+    border-color: #d97706;
+    color: #fbbf24;
+  }
+  .findoc-sidebar-toggle .findoc-toggle-count {
+    background: #292524;
+    color: #a8a29e;
+  }
+  .findoc-sidebar-toggle.has-docs .findoc-toggle-count {
+    background: #78350f;
+    color: #fde68a;
+  }
+
+  .findoc-sidebar {
+    background: #1c1917;
+    border-left-color: #44403c;
+    box-shadow: -8px 0 28px rgba(0, 0, 0, 0.4);
+  }
+  .findoc-sidebar-header {
+    border-bottom-color: #292524;
+  }
+  .findoc-sidebar-title { color: #fafaf9; }
+  .findoc-sidebar-title-text { color: #fafaf9; }
+  .findoc-sidebar-title-icon {
+    background: rgba(217, 119, 6, 0.15);
+    color: #fbbf24;
+  }
+  .findoc-sidebar-count {
+    background: #292524;
+    color: #a8a29e;
+  }
+  .findoc-sidebar-iconbtn {
+    color: #a8a29e;
+  }
+  .findoc-sidebar-iconbtn:hover {
+    background: #292524;
+    border-color: #44403c;
+    color: #e7e5e4;
+  }
+  .findoc-sidebar-overlay {
+    background: rgba(0, 0, 0, 0.6);
+  }
+
+  .findoc-sidebar-dropzone {
+    background: #292524;
+    border-color: #44403c;
+  }
+  .findoc-sidebar-dropzone:hover,
+  .findoc-sidebar-dropzone.dragover {
+    background: #1f1c1a;
+    border-color: #d97706;
+  }
+  .findoc-dropzone-text { color: #d6d3d1; }
+  .findoc-dropzone-link { color: #fbbf24; }
+  .findoc-dropzone-hint { color: #78716c; }
+
+  .findoc-doc-card {
+    background: #292524;
+    border-color: #44403c;
+  }
+  .findoc-doc-card:hover {
+    border-color: #78350f;
+  }
+  .findoc-doc-preview {
+    background: #1c1917;
+    border-bottom-color: #44403c;
+  }
+  .findoc-doc-preview-fallback {
+    background: repeating-linear-gradient(
+      45deg,
+      #1c1917,
+      #1c1917 8px,
+      #292524 8px,
+      #292524 16px
+    );
+  }
+  .findoc-doc-preview-noimage {
+    background: #292524;
+    color: #78716c;
+    border-color: #44403c;
+  }
+  .findoc-doc-preview-ext {
+    background: #292524;
+    border-color: #44403c;
+    color: #a8a29e;
+  }
+  .findoc-doc-name { color: #e7e5e4; }
+  .findoc-doc-meta { color: #a8a29e; }
+  .findoc-doc-progress { background: #1c1917; }
+  .findoc-doc-progress-msg { color: #a8a29e; }
+  .findoc-doc-action {
+    background: #1c1917;
+    border-color: #44403c;
+    color: #d6d3d1;
+  }
+  .findoc-doc-action:hover {
+    background: #292524;
+    border-color: #57534e;
+    color: #fafaf9;
+  }
+  .findoc-doc-action.danger:hover {
+    background: #450a0a;
+    border-color: #991b1b;
+    color: #fecaca;
+  }
+
+  .findoc-empty-icon {
+    background: #292524;
+    color: #57534e;
+  }
+  .findoc-empty-title { color: #d6d3d1; }
+  .findoc-empty-hint { color: #78716c; }
+
+  .findoc-skeleton {
+    background: linear-gradient(90deg, #292524 25%, #44403c 50%, #292524 75%);
+    background-size: 200% 100%;
+  }
+}

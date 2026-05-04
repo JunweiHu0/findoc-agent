@@ -13,7 +13,7 @@ allow_origins = ["*"]
 [features]
 # Step 折叠、复制按钮等保留默认
 prompt_playground = true
-unsafe_allow_html = false
+unsafe_allow_html = true
 latex = false
 auto_tag_thread = true
 
@@ -31,6 +31,7 @@ default_collapse_content = true
 hide_cot = false
 github = "https://github.com/JunweiHu0/findoc-agent"
 custom_css = "/public/stylesheet.css"
+custom_js = "/public/sidebar.js"
 
 [UI.theme]
 default = "light"

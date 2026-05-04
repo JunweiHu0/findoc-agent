@@ -25,10 +25,11 @@ if str(_PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(_PROJECT_ROOT))
 
 from fastapi import FastAPI, Request
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from loguru import logger
 
-from agent.config import CONFIG, INDEX_DIR, PAGES_DIR
+from agent.config import CONFIG, INDEX_DIR, PAGES_DIR, ROOT
 from agent.graph import compile_graph
 from agent.state import Citation, PageHit
 from backend.schemas import (
@@ -228,6 +229,13 @@ def _citation_to_out(c: Citation) -> CitationOut:
 # FastAPI app
 # ---------------------------------------------------------------------------
 app = FastAPI(title="FinDoc Agent API", version="0.1.0")
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
 
 
 @app.on_event("startup")
@@ -477,11 +485,88 @@ async def delete_conversation_endpoint(conv_id: str):
 # P14: Document / Upload endpoints (stubs — pipeline in ingestion/upload.py)
 # ---------------------------------------------------------------------------
 
+_PAGE_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
+_THUMB_FILENAME = "_thumb.jpg"
+_THUMB_MAX = 480              # max edge in px — sidebar card is ~300px, leaves HiDPI headroom
+_THUMB_QUALITY = 78           # JPEG quality
+_THUMB_CACHE_HEADERS = {"Cache-Control": "public, max-age=86400"}
+
+
+def _find_page_image(doc_id: str) -> Path | None:
+    """Return the first page image for this doc, regardless of naming.
+
+    Scans the doc's pages dir for any *.png / *.jpg / *.jpeg / *.webp file
+    (excluding our own cached `_thumb.jpg`). Returns None when the dir is
+    missing or empty — the frontend then renders a plain text fallback.
+    """
+    pages_dir = PAGES_DIR / doc_id
+    if not pages_dir.exists():
+        return None
+    candidates = [
+        p for p in pages_dir.iterdir()
+        if p.is_file()
+        and p.suffix.lower() in _PAGE_IMG_EXTS
+        and p.name != _THUMB_FILENAME
+    ]
+    if not candidates:
+        return None
+    candidates.sort(key=lambda p: p.name)  # p001 < p002 < ...
+    return candidates[0]
+
+
+def _build_thumb_data_url(doc_id: str) -> str | None:
+    """Generate (or read cached) thumbnail and return it as a base64 data URL.
+
+    Inlining the bytes in the /documents response eliminates the N follow-up
+    HTTP requests the panel previously made — one request now returns
+    everything the sidebar needs to render.
+    """
+    import base64
+
+    source = _find_page_image(doc_id)
+    if source is None:
+        return None
+
+    thumb = source.parent / _THUMB_FILENAME
+    try:
+        if not thumb.exists() or thumb.stat().st_mtime < source.stat().st_mtime:
+            from PIL import Image
+            with Image.open(source) as im:
+                im = im.convert("RGB")
+                im.thumbnail((_THUMB_MAX, _THUMB_MAX), Image.LANCZOS)
+                im.save(thumb, "JPEG", quality=_THUMB_QUALITY, optimize=True, progressive=True)
+        b64 = base64.b64encode(thumb.read_bytes()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    except Exception as e:
+        logger.warning(f"thumbnail generation failed for {doc_id}: {e}")
+        return None
+
+
 @app.get("/api/v1/documents", response_model=list[DocumentOut])
 async def list_documents_all():
-    """List all documents (indexed + uploaded)."""
+    """List user-uploaded documents with inlined thumbnails.
+
+    Default offline indexes remain queryable but are not part of the user
+    document management surface. Thumbnails are generated in parallel on a
+    thread pool (PIL releases the GIL during decode/resize) and inlined as
+    base64 so the panel needs only this one request to render.
+    """
+    import asyncio
+
     docs = storage.list_documents()
-    return [DocumentOut(**d) for d in docs]
+    uploads_dir = ROOT / "data" / "uploads"
+    user_docs = [d for d in docs if (uploads_dir / d["doc_id"]).exists()]
+
+    if user_docs:
+        loop = asyncio.get_event_loop()
+        thumbs = await asyncio.gather(*[
+            loop.run_in_executor(None, _build_thumb_data_url, d["doc_id"])
+            for d in user_docs
+        ])
+        for d, t in zip(user_docs, thumbs):
+            d["thumbnail"] = t
+
+    return [DocumentOut(**d) for d in user_docs]
 
 
 @app.delete("/api/v1/documents/{doc_id}")
@@ -607,12 +692,30 @@ async def reindex_doc(doc_id: str):
 
 @app.get("/api/v1/documents/{doc_id}/cover")
 async def doc_cover(doc_id: str):
-    """Return the first-page PNG as a thumbnail. 404 if no pages on disk."""
+    """Standalone cover endpoint — kept for backward compatibility.
+
+    The sidebar inlines thumbnails through /api/v1/documents directly and
+    no longer hits this route. Existing callers still get a JPEG thumbnail.
+    """
     from fastapi.responses import FileResponse, JSONResponse
-    cover = PAGES_DIR / doc_id / "p001.png"
-    if not cover.exists():
-        return JSONResponse(status_code=404, content={"detail": "No cover available"})
-    return FileResponse(str(cover), media_type="image/png")
+
+    source = _find_page_image(doc_id)
+    if source is None:
+        return JSONResponse(status_code=404, content={"detail": "No image available"})
+
+    thumb = source.parent / _THUMB_FILENAME
+    try:
+        if not thumb.exists() or thumb.stat().st_mtime < source.stat().st_mtime:
+            from PIL import Image
+            with Image.open(source) as im:
+                im = im.convert("RGB")
+                im.thumbnail((_THUMB_MAX, _THUMB_MAX), Image.LANCZOS)
+                im.save(thumb, "JPEG", quality=_THUMB_QUALITY, optimize=True, progressive=True)
+    except Exception as e:
+        logger.warning(f"thumbnail generation failed for {doc_id}: {e} — falling back to source")
+        return FileResponse(str(source), headers=_THUMB_CACHE_HEADERS)
+
+    return FileResponse(str(thumb), media_type="image/jpeg", headers=_THUMB_CACHE_HEADERS)
 
 
 # ---------------------------------------------------------------------------
