@@ -64,7 +64,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
 
-        -- P25: cross-turn fact memory
+        -- P25: cross-turn fact memory (P28: upgraded with embedding + verification)
         CREATE TABLE IF NOT EXISTS conv_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -81,8 +81,58 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
 
         CREATE INDEX IF NOT EXISTS idx_conv_facts_lookup
             ON conv_facts(conv_id, entity, period, metric);
+
+        -- P26.5: runtime todo tracking (one JSON blob per turn)
+        CREATE TABLE IF NOT EXISTS turn_todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+            turn_id INTEGER NOT NULL DEFAULT 0,
+            items_json TEXT NOT NULL DEFAULT '[]',
+            created_at REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_turn_todos_conv
+            ON turn_todos(conv_id, turn_id);
+
+        -- P28: global cross-conversation fact memory
+        CREATE TABLE IF NOT EXISTS global_facts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity TEXT DEFAULT '',
+            period TEXT DEFAULT '',
+            metric TEXT DEFAULT '',
+            value REAL,
+            unit TEXT DEFAULT '',
+            source_doc TEXT NOT NULL DEFAULT '',
+            source_page INTEGER NOT NULL DEFAULT 0,
+            text TEXT NOT NULL DEFAULT '',
+            fact_embedding BLOB,
+            grounding_verified INTEGER DEFAULT 0,
+            hit_count INTEGER DEFAULT 0,
+            tainted INTEGER DEFAULT 0,
+            last_hit_at REAL,
+            created_at REAL NOT NULL
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_global_facts_lookup
+            ON global_facts(entity, period, metric);
         """
     )
+    conn.commit()
+
+
+def _migrate_schema(conn: sqlite3.Connection) -> None:
+    """Add columns added post-P25 if they don't exist (idempotent)."""
+    migrations = [
+        "ALTER TABLE conv_facts ADD COLUMN fact_embedding BLOB",
+        "ALTER TABLE conv_facts ADD COLUMN grounding_verified INTEGER DEFAULT 0",
+        "ALTER TABLE conv_facts ADD COLUMN hit_count INTEGER DEFAULT 0",
+        "ALTER TABLE conv_facts ADD COLUMN tainted INTEGER DEFAULT 0",
+    ]
+    for sql in migrations:
+        try:
+            conn.execute(sql)
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -90,6 +140,7 @@ def init_db() -> None:
     with _lock:
         conn = _get_conn()
         _ensure_tables(conn)
+        _migrate_schema(conn)
         conn.close()
     logger.info(f"Database initialized at {DB_PATH}")
 
@@ -355,6 +406,43 @@ def save_conv_facts(conv_id: str, facts: list[dict]) -> None:
     logger.debug(f"Saved {len(facts)} facts for conv {conv_id}")
 
 
+def save_conv_facts_enriched(conv_id: str, facts: list[dict], embeddings: list | None = None) -> None:
+    """Save structured facts with optional embeddings (P28)."""
+    if not conv_id or not facts:
+        return
+    now = time.time()
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        _migrate_schema(conn)
+        for i, f in enumerate(facts):
+            entity = (f.get("entity") or "").strip()
+            period = (f.get("period") or "").strip()
+            metric = (f.get("metric") or "").strip()
+            if not entity and not period and not metric:
+                continue
+            emb = None
+            if embeddings and i < len(embeddings):
+                emb = embeddings[i]
+            conn.execute(
+                "INSERT OR REPLACE INTO conv_facts "
+                "(conv_id, entity, period, metric, value, unit, source_doc, source_page, text, "
+                "grounding_verified, hit_count, tainted, fact_embedding, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    conv_id, entity, period, metric,
+                    f.get("value"), (f.get("unit") or ""),
+                    f.get("source_doc", ""), f.get("source_page", 0),
+                    f.get("text", ""),
+                    f.get("grounding_verified", 0), f.get("hit_count", 0),
+                    f.get("tainted", 0),
+                    emb, now,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+
 def load_conv_facts(conv_id: str) -> list[dict]:
     """Load all structured facts from prior turns of this conversation."""
     if not conv_id:
@@ -376,6 +464,136 @@ def load_conv_facts(conv_id: str) -> list[dict]:
         }
         for r in rows
     ]
+
+
+# ---------------------------------------------------------------------------
+# P26.5: Turn todo persistence
+# ---------------------------------------------------------------------------
+
+def save_turn_todos(conv_id: str, turn_id: int, items: list[dict]) -> None:
+    """Persist runtime todo items for a turn."""
+    if not conv_id or not items:
+        return
+    now = time.time()
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        conn.execute(
+            "INSERT INTO turn_todos (conv_id, turn_id, items_json, created_at) VALUES (?, ?, ?, ?)",
+            (conv_id, turn_id, json.dumps(items, ensure_ascii=False), now),
+        )
+        conn.commit()
+        conn.close()
+
+
+def load_turn_todos(conv_id: str, turn_id: int) -> list[dict]:
+    """Load runtime todo items for a turn."""
+    if not conv_id:
+        return []
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        row = conn.execute(
+            "SELECT items_json FROM turn_todos WHERE conv_id = ? AND turn_id = ? ORDER BY id DESC LIMIT 1",
+            (conv_id, turn_id),
+        ).fetchone()
+        conn.close()
+    if row:
+        try:
+            return json.loads(row[0])
+        except Exception:
+            return []
+    return []
+
+
+# ---------------------------------------------------------------------------
+# P28: Global facts (cross-conversation semantic memory)
+# ---------------------------------------------------------------------------
+
+def upsert_global_fact(fact: dict) -> None:
+    """Insert or update a global fact. Called when hit_count >= threshold and grounding_verified."""
+    now = time.time()
+    entity = (fact.get("entity") or "").strip()
+    period = (fact.get("period") or "").strip()
+    metric = (fact.get("metric") or "").strip()
+    if not entity and not period and not metric:
+        return
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        existing = conn.execute(
+            "SELECT id, hit_count FROM global_facts WHERE entity=? AND period=? AND metric=? AND value=?",
+            (entity, period, metric, fact.get("value")),
+        ).fetchone()
+        if existing:
+            conn.execute(
+                "UPDATE global_facts SET hit_count=hit_count+1, last_hit_at=? WHERE id=?",
+                (now, existing[0]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO global_facts "
+                "(entity, period, metric, value, unit, source_doc, source_page, text, "
+                "grounding_verified, hit_count, tainted, last_hit_at, created_at) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?)",
+                (
+                    entity, period, metric, fact.get("value"), fact.get("unit", ""),
+                    fact.get("source_doc", ""), fact.get("source_page", 0), fact.get("text", ""),
+                    fact.get("grounding_verified", 0), fact.get("tainted", 0),
+                    now, now,
+                ),
+            )
+        conn.commit()
+        conn.close()
+
+
+def load_global_facts(entity: str = "", period: str = "", metric: str = "", min_hits: int = 3) -> list[dict]:
+    """Load global facts with optional filters. Only returns verified facts with hit_count >= min_hits."""
+    with _lock:
+        conn = _get_conn()
+        _ensure_tables(conn)
+        conditions = ["grounding_verified = 1", "hit_count >= ?"]
+        params: list = [min_hits]
+        if entity:
+            conditions.append("entity = ?")
+            params.append(entity)
+        if period:
+            conditions.append("period = ?")
+            params.append(period)
+        if metric:
+            conditions.append("metric = ?")
+            params.append(metric)
+        where = " AND ".join(conditions)
+        rows = conn.execute(
+            f"SELECT entity, period, metric, value, unit, source_doc, source_page, text, "
+            f"hit_count, grounding_verified FROM global_facts WHERE {where} ORDER BY hit_count DESC",
+            params,
+        ).fetchall()
+        conn.close()
+    return [
+        {
+            "entity": r[0], "period": r[1], "metric": r[2], "value": r[3],
+            "unit": r[4], "source_doc": r[5], "source_page": r[6], "text": r[7],
+            "hit_count": r[8], "grounding_verified": r[9],
+        }
+        for r in rows
+    ]
+
+
+def mark_conv_fact_verified(fact_id: int, verified: bool = True) -> None:
+    """Mark a conv_fact as grounding-verified or tainted (P28 feedback loop)."""
+    with _lock:
+        conn = _get_conn()
+        if verified:
+            conn.execute(
+                "UPDATE conv_facts SET grounding_verified = 1, tainted = 0 WHERE id = ?", (fact_id,),
+            )
+        else:
+            conn.execute(
+                "UPDATE conv_facts SET tainted = 1 WHERE id = ?", (fact_id,),
+            )
+        conn.commit()
+        conn.close()
 
 
 # ---------------------------------------------------------------------------

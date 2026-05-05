@@ -1,5 +1,6 @@
 agent:
   max_reflexion_iter: 3
+  semantic_memory_min_hits: 3
 
 llm:
   provider: deepseek

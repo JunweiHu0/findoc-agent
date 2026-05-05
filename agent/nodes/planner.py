@@ -10,9 +10,11 @@ import json
 
 from loguru import logger
 
+from ..compression import compress_history
 from ..config import INDEX_DIR
 from ..llm import get_llm, has_llm_key
 from ..prompts import load_prompt
+from ..retry import classify_error
 from ..schemas import PlannerOutput
 from ..state import AgentState, SubTask
 from tools.registry import get_tools_for_prompt
@@ -118,55 +120,122 @@ def _render_candidate_docs(state: AgentState) -> str:
     return "\n".join(lines)
 
 
-def _render_history(state: AgentState, max_chars_per_turn: int = 200) -> str:
-    """Render chat_history as compact bullet lines for the planner prompt.
-
-    Each entry is {"role": "user"|"assistant", "content": str}. Long
-    assistant answers are truncated — coreference resolution only needs the
-    entities mentioned, not the full citation list.
-    """
-    history = state.get("chat_history") or []
-    if not history:
-        return "(no prior turns)"
-    lines: list[str] = []
-    for turn in history:
-        role = turn.get("role", "?")
-        content = (turn.get("content") or "").strip().replace("\n", " ")
-        if len(content) > max_chars_per_turn:
-            content = content[:max_chars_per_turn] + "…"
-        prefix = "U" if role == "user" else "A"
-        lines.append(f"{prefix}: {content}")
-    return "\n".join(lines)
-
-
 def planner_node(state: AgentState) -> dict:
-    """Call LLM to decompose the user query into an ordered list of SubTasks.
+    """P30+P32 two-stage: match skill → classify query → load variant prompt → generate plan.
 
-    Falls back to a single-SubTask plan (sub_query = original query) when
-    the LLM key is missing or the call fails.
+    Stage 0 (P32): Check skill registry for a matching skill. If found, use its
+                   plan_template and strategy overrides.
+    Stage 1 (P30): Lightweight classification (~200 tokens) to determine query_class.
+    Stage 2 (P30): Load variant-specific prompt + few-shot examples, generate full plan.
+
+    Falls back to a single-SubTask plan when LLM key is missing or call fails.
+    P27: uses compress_history instead of raw _render_history.
     """
     if not has_llm_key():
         logger.warning("DEEPSEEK_API_KEY not set — planner falls back to single sub-task")
         return _fallback(state)
 
+    query = state["query"]
+    history = state.get("chat_history") or []
+    compressed_ctx = compress_history(history) if history else "(no prior turns)"
+    doc_metadata = _render_candidate_docs(state)
+
+    # P32 Stage 0: match skill
+    skill = None
+    skill_strategy = {}
+    try:
+        from skills.registry import match_skill as _match_skill
+        skill = _match_skill(query)
+        if skill:
+            skill_strategy = dict(skill.strategy)
+            logger.info(f"planner: using skill '{skill.name}', template={skill.plan_template}")
+    except ImportError:
+        pass
+
+    # Stage 1: classify query type (lightweight, ~200 tokens).
+    # If skill matched, use its plan_template as the query_class directly.
+    query_class = state.get("query_class") or ""
+    if not query_class:
+        if skill and skill.plan_template != "base":
+            query_class = skill.plan_template
+        else:
+            query_class = _classify_query(query, compressed_ctx)
+
+    # Stage 2: load variant-specific prompt with few-shot
+    try:
+        variant_prompt = load_prompt("planner", variant=query_class or "base", with_few_shot=True)
+    except Exception:
+        variant_prompt = _PROMPT
+
     try:
         llm = get_llm("planner").with_structured_output(PlannerOutput, method="json_mode")
-        # P22: use richer candidate_docs when scout ran; fall back to basic metadata
-        doc_metadata = _render_candidate_docs(state)
-        prompt = _PROMPT.format(
-            query=state["query"],
+        prompt = variant_prompt.format(
+            query=query,
             doc_metadata=doc_metadata,
-            chat_history=_render_history(state),
+            chat_history=compressed_ctx,
             available_tools=get_tools_for_prompt(),
         )
         result: PlannerOutput = llm.invoke(prompt)
         plan = [SubTask(**item.model_dump()) for item in result.plan]
         if not plan:
             return _fallback(state)
-        return {"plan": plan, "plan_cursor": 0}
+
+        delta: dict = {
+            "plan": plan,
+            "plan_cursor": 0,
+            "query_class": result.query_class or query_class,
+        }
+        # Pass skill strategy to executor via remediation_hint (compatible field)
+        if skill_strategy:
+            delta["remediation_hint"] = skill_strategy
+        return delta
     except Exception as e:
+        err = classify_error(e)
+        err["node"] = "planner"
         logger.warning(f"planner LLM call failed ({e}); falling back to single sub-task")
-        return _fallback(state)
+        fb = _fallback(state)
+        fb["error_log"] = [err]
+        return fb
+
+
+def _classify_query(query: str, chat_context: str = "") -> str:
+    """Stage 1: Lightweight query classification (~200 token LLM call).
+
+    Returns one of: single_fact, cross_doc_compare, multi_step_calc, trend_analysis.
+    Falls back to 'single_fact' on any error.
+    """
+    # Quick heuristic: check for keywords to avoid unnecessary LLM calls
+    if any(kw in query for kw in ["对比", "比较", "vs", "versus", "差异", "哪个"]):
+        return "cross_doc_compare"
+    if any(kw in query for kw in ["趋势", "变化", "增长", "逐年", "历年"]):
+        return "trend_analysis"
+    if any(kw in query for kw in ["计算", "算一下", "比例", "占比"]) or (
+        "毛利率" in query and ("营收" in query or "成本" in query)
+    ):
+        return "multi_step_calc"
+
+    # Heuristic not conclusive — use lightweight LLM call
+    if not has_llm_key():
+        return "single_fact"
+
+    try:
+        llm = get_llm("planner")
+        prompt = (
+            "将以下用户问题归类为以下四种之一。只返回类别名称，不要额外文字。\n\n"
+            "类别: single_fact, cross_doc_compare, multi_step_calc, trend_analysis\n"
+            f"对话上下文: {chat_context[:200]}\n"
+            f"问题: {query}\n\n"
+            "类别:"
+        )
+        resp = llm.invoke(prompt)
+        result = (resp.content or "").strip().lower()
+        valid = {"single_fact", "cross_doc_compare", "multi_step_calc", "trend_analysis"}
+        for v in valid:
+            if v in result:
+                return v
+        return "single_fact"
+    except Exception:
+        return "single_fact"
 
 
 def _fallback(state: AgentState) -> dict:

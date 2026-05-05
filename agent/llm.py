@@ -35,5 +35,7 @@ def get_llm(role: str = "planner", **kwargs) -> ChatOpenAI:
         api_key=DEEPSEEK_API_KEY or "EMPTY",
         base_url=DEEPSEEK_BASE_URL,
         temperature=kwargs.pop("temperature", CONFIG["llm"].get("temperature", 0.0)),
+        timeout=kwargs.pop("timeout", 60),
+        max_retries=kwargs.pop("max_retries", 3),
         **kwargs,
     )

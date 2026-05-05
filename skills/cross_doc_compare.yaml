@@ -1,0 +1,12 @@
+skill: cross_doc_compare
+description: Cross-document metric comparison
+triggers: ["对比", "比较", "vs", "versus", "差异", "哪个更高", "哪个更低", "孰高"]
+plan_template: cross_doc_compare
+tools: [retrieve_pages, read_page_with_vlm, calculate, disambiguate_caliber]
+strategy:
+  retrieve_top_k: 5
+  parallel_fan_out: true
+  caliber_check: required
+  diff_threshold: 0.05
+verifier: numeric
+output_schema: ComparisonTable

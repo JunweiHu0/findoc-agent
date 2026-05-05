@@ -1,0 +1,11 @@
+skill: trend_analysis
+description: Multi-period trend analysis for a single metric
+triggers: ["趋势", "变化", "增长趋势", "逐年", "历年", "近[0-9]年", "过去[0-9]年"]
+plan_template: trend_analysis
+tools: [retrieve_pages, read_page_with_vlm, calculate]
+strategy:
+  retrieve_top_k: 8
+  parallel_fan_out: true
+  caliber_check: true
+verifier: numeric
+output_schema: TrendSeries

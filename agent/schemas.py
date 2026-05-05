@@ -18,11 +18,15 @@ class ToolCall(BaseModel):
 
 
 class PlanItemSchema(BaseModel):
-    """One step in the planner's execution plan."""
+    """One step in the planner's execution plan (P29: DAG-aware)."""
     sub_query: str = Field(description="Retrieval query, or arithmetic expression if expected_output_schema is 'number'.")
     target_doc: Optional[str] = Field(default=None, description="Restrict retrieval to this doc_id, or null for any.")
     expected_output_schema: str = Field(default="text", description='"number" | "text" | "table"')
-    tool_calls: list[ToolCall] = Field(default_factory=list, description="P21: explicit tool dispatch list (takes priority over expected_output_schema when non-empty).")
+    tool_calls: list[ToolCall] = Field(default_factory=list, description="P21: explicit tool dispatch list.")
+    # P29: DAG fields
+    task_id: str = Field(default="", description="Unique id for DAG scheduling.")
+    depends_on: list[str] = Field(default_factory=list, description="Task IDs this step must wait for.")
+    priority: Literal[0, 1] = Field(default=0, description="0=core, 1=exploratory.")
 
 
 class PlannerOutput(BaseModel):
@@ -48,6 +52,17 @@ class MissingFact(BaseModel):
     suggested_query: Optional[str] = Field(default=None, description="Rewritten query for re-retrieval (retrieval_miss / ambiguous_query).")
     suggested_target_doc: Optional[str] = Field(default=None, description="Constrain re-retrieval to this doc_id.")
     suggested_page_nums: Optional[list[int]] = Field(default=None, description="Re-read only these page numbers (reading_miss).")
+
+
+class TodoItemSchema(BaseModel):
+    """Schema for runtime todo tracking (P26.5)."""
+    id: str = Field(default="")
+    sub_task_idx: int = Field(default=0)
+    title: str = Field(default="")
+    status: Literal["pending", "running", "done", "failed", "skipped"] = Field(default="pending")
+    attempt: int = Field(default=0)
+    error: Optional[str] = Field(default=None)
+    parent_id: Optional[str] = Field(default=None)
 
 
 class VerifierOutput(BaseModel):

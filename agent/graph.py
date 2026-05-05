@@ -15,6 +15,7 @@ from .config import MAX_REFLEXION_ITER
 from .llm import has_llm_key
 from .nodes.executor import executor_node
 from .nodes.grounding import grounding_node
+from .nodes.plan_critic import plan_critic_node, should_trigger_plan_critic
 from .nodes.planner import planner_node, retrieval_scout_node
 from .nodes.remediation import remediation_node
 from .nodes.synthesizer import synthesizer_node
@@ -32,12 +33,21 @@ def _route_after_verifier(state: AgentState) -> str:
     return "remediation"
 
 
+def _route_after_executor(state: AgentState) -> str:
+    """P29: Conditionally route to plan_critic if signal detected, otherwise verifier."""
+    if should_trigger_plan_critic(state):
+        logger.info("plan_critic triggered — routing to plan review")
+        return "plan_critic"
+    return "verifier"
+
+
 def build_graph() -> StateGraph:
-    """Construct the raw StateGraph with all 7 nodes and edges (not yet compiled)."""
+    """Construct the raw StateGraph with all nodes and edges (not yet compiled)."""
     g = StateGraph(AgentState)
     g.add_node("retrieval_scout", retrieval_scout_node)
     g.add_node("planner", planner_node)
     g.add_node("executor", executor_node)
+    g.add_node("plan_critic", plan_critic_node)
     g.add_node("verifier", verifier_node)
     g.add_node("remediation", remediation_node)
     g.add_node("synthesizer", synthesizer_node)
@@ -46,7 +56,12 @@ def build_graph() -> StateGraph:
     g.set_entry_point("retrieval_scout")
     g.add_edge("retrieval_scout", "planner")
     g.add_edge("planner", "executor")
-    g.add_edge("executor", "verifier")
+    g.add_conditional_edges(
+        "executor",
+        _route_after_executor,
+        {"verifier": "verifier", "plan_critic": "plan_critic"},
+    )
+    g.add_edge("plan_critic", "executor")  # loop back after revision
     g.add_conditional_edges(
         "verifier",
         _route_after_verifier,
@@ -83,6 +98,11 @@ if __name__ == "__main__":
         "unverified_claims": [],
         "fact_index": {},
         "known_facts": [],
+        "error_log": [],
+        "todo_items": [],
+        "todo_updates": [],
+        "query_class": "",
+        "agent_profile": {},
     }
     out = app.invoke(init)
     print("\n=== Final state ===")

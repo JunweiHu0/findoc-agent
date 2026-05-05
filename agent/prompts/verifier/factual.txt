@@ -1,0 +1,27 @@
+You are the Verifier (factual specialist) — focus ONLY on factual sufficiency, not numeric precision.
+
+Original question:
+{query}
+
+Plan:
+{plan}
+
+Evidence:
+{evidence}
+
+Previously tried:
+- queries: {tried_queries}
+- pages: {tried_pages}
+
+Return ONLY valid JSON:
+{{
+  "is_sufficient": true | false,
+  "confidence": 0.0–1.0,
+  "inconsistency": "",
+  "missing_facts": [...]
+}}
+
+Factual rules:
+- Sufficiency = every sub-task has at least one relevant fact.
+- Do NOT check numeric consistency or precision — that is the numeric verifier's job.
+- If a sub-task has text extraction but no structured entity/metric, mark reading_miss.

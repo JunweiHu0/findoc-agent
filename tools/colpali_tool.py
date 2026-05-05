@@ -107,16 +107,24 @@ def preload() -> bool:
 def _encode_query_remote(query: str) -> "torch.Tensor | None":
     """Encode query via ColQwen Service. Returns None on failure."""
     import httpx
+    from agent.retry import with_retry as _retry
+
     url = CONFIG.get("services", {}).get("colqwen_url", "")
     if not url:
         return None
-    try:
+
+    @_retry(max_attempts=3, base=1.0, cap=30.0)
+    def _do_post():
         resp = httpx.post(
             f"{url}/predict",
             json={"action": "encode_query", "query": query},
             timeout=30.0,
         )
         resp.raise_for_status()
+        return resp
+
+    try:
+        resp = _do_post()
         data = resp.json()
         return torch.tensor(data["embedding"], dtype=torch.float16)
     except Exception as e:

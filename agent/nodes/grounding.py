@@ -91,6 +91,9 @@ def grounding_node(state: AgentState) -> dict:
     clean_answer = _strip_unverified_citations(answer, unverified)
     clean_answer = _add_grounding_banner(clean_answer, grounding_score, unverified)
 
+    # P28: Feedback writeback — mark matched facts as verified
+    _writeback_verification(state, unverified)
+
     logger.info(
         f"grounding: score={grounding_score:.2f}, "
         f"citations={len(citations)}, numbers={len(list(_NUMERIC_RE.finditer(answer)))}, "
@@ -102,6 +105,61 @@ def grounding_node(state: AgentState) -> dict:
         "grounding_score": grounding_score,
         "unverified_claims": unverified,
     }
+
+
+def _writeback_verification(state: AgentState, unverified: list[dict]) -> None:
+    """P28: Write grounding verification results back to conv_facts.
+
+    Facts whose citations appear in the answer and pass numeric checks are
+    marked grounding_verified=1. Facts with unverified citations/numbers
+    are marked tainted=1. Also checks for promotion to global_facts (L3).
+    """
+    try:
+        from backend.storage import mark_conv_fact_verified, load_conv_facts, upsert_global_fact
+        from agent.config import CONFIG
+
+        facts = state.get("extracted_facts") or []
+        if not facts:
+            return
+
+        # Collect unverified citation strings for quick lookup
+        bad_cites = {
+            u["text"] for u in unverified
+            if u.get("reason") == "citation_not_in_evidence"
+        }
+
+        for f in facts:
+            entity = (f.entity or "").strip()
+            period = (f.period or "").strip()
+            metric = (f.metric or "").strip()
+            if not entity and not period and not metric:
+                continue
+
+            cite_str = f"[{f.source_doc} p.{f.source_page}]"
+            verified = cite_str not in bad_cites
+
+            # Load the fact from DB to get its id
+            stored = load_conv_facts(state.get("conv_id", ""))
+            for sf in stored:
+                if (
+                    sf.get("entity") == entity
+                    and sf.get("period") == period
+                    and sf.get("metric") == metric
+                    and abs((sf.get("value") or 0) - (f.value or 0)) < 0.001
+                ):
+                    mark_conv_fact_verified(sf.get("id", 0), verified=verified)
+                    # Check promotion threshold
+                    min_hits = CONFIG.get("agent", {}).get("semantic_memory_min_hits", 3)
+                    if verified and (sf.get("hit_count", 0) + 1) >= min_hits:
+                        upsert_global_fact({
+                            "entity": entity, "period": period, "metric": metric,
+                            "value": f.value, "unit": f.unit or "",
+                            "source_doc": f.source_doc, "source_page": f.source_page,
+                            "text": f.text, "grounding_verified": 1,
+                        })
+                    break
+    except Exception as e:
+        logger.debug(f"grounding writeback skipped: {e}")
 
 
 def _fuzzy_match(value: float, known: list[tuple[float, str]]) -> Optional[tuple[float, str]]:

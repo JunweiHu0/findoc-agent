@@ -1,0 +1,10 @@
+skill: single_fact
+description: Single fact lookup from one document
+triggers: []
+plan_template: single_fact
+tools: [retrieve_pages, read_page_with_vlm]
+strategy:
+  retrieve_top_k: 5
+  parallel_fan_out: false
+  caliber_check: false
+output_schema: Fact

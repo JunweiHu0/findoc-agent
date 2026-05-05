@@ -1,0 +1,11 @@
+skill: multi_step_calc
+description: Multi-step calculation requiring raw figure retrieval then arithmetic
+triggers: ["计算", "算一下", "比例", "占比", "同比", "增长率", "复合增长", "平均"]
+plan_template: multi_step_calc
+tools: [retrieve_pages, read_page_with_vlm, calculate]
+strategy:
+  retrieve_top_k: 5
+  parallel_fan_out: true
+  caliber_check: false
+verifier: numeric
+output_schema: NumericResult

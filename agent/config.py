@@ -32,3 +32,4 @@ CHECKPOINTS_DIR = ROOT / "checkpoints"
 
 MAX_REFLEXION_ITER: int = CONFIG["agent"]["max_reflexion_iter"]
 TOP_K: int = CONFIG["retriever"]["top_k"]
+SEMANTIC_MEMORY_MIN_HITS: int = CONFIG["agent"].get("semantic_memory_min_hits", 3)

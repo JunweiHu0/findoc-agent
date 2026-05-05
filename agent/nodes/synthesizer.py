@@ -52,9 +52,17 @@ def synthesizer_node(state: AgentState) -> dict:
         _push_token(answer)  # let UI still see something arrive incrementally
         return {"answer": answer, "citations": citations}
 
+    # P30: select synthesizer variant based on query_class
+    qc = state.get("query_class", "")
+    syn_variant = "numeric" if qc in ("multi_step_calc", "cross_doc_compare") else "base"
+    try:
+        variant_prompt = load_prompt("synthesizer", variant=syn_variant)
+    except Exception:
+        variant_prompt = _PROMPT
+
     try:
         llm = get_llm("synthesizer")
-        prompt = _PROMPT.format(query=state["query"], evidence=_render_evidence(facts, cvs))
+        prompt = variant_prompt.format(query=state["query"], evidence=_render_evidence(facts, cvs))
 
         # If a token hook is registered, stream chunks; otherwise fall back to invoke().
         if _token_hook is not None:

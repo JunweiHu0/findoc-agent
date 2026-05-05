@@ -34,10 +34,14 @@ from app.data_layer import FinDocDataLayer
 _BACKEND_URL = CONFIG.get("backend", {}).get("url", "http://localhost:8001")
 
 _NODE_LABELS: dict[str, str] = {
+    "retrieval_scout": "\U0001f50e Scout",
     "planner": "\U0001f9e0 Planner",
-    "executor": "\U0001f527 Executor",
+    "executor": "\U0001f4e5 Executor",
+    "plan_critic": "\U0001f52c Plan Review",
     "verifier": "\U0001f50d Verifier",
-    "synthesizer": "✍️ Synthesizer",
+    "remediation": "\U0001f6e0 Fix",
+    "synthesizer": "✏️ Synthesizer",
+    "grounding": "\U0001f4cb Grounding",
 }
 
 _UPLOAD_ACCEPT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"}
@@ -290,10 +294,12 @@ async def on_message(msg: cl.Message):
         conv_id = cl.user_session.get("conv_id")
     cl.user_session.set("conv_id", conv_id)
 
-    _status_step: cl.Step | None = None
+    _status_msg: cl.Message | None = None  # transient progress message
     final_answer = ""
     final_citations: list[dict] = []
     final_pages: list[dict] = []
+    final_grounding_score: float = 1.0
+    final_unverified: list[dict] = []
     streaming_msg: cl.Message | None = None  # P16: token-by-token typewriter
     streamed_text = ""
 
@@ -331,17 +337,26 @@ async def on_message(msg: cl.Message):
                     etype = data.get("type", "")
 
                     if etype == "error":
-                        await cl.Message(content=f"❌ Agent 执行失败：{data.get('message', '未知错误')}").send()
+                        msg = data.get('message', '未知错误')
+                        retryable = data.get('retryable', False)
+                        retry_hint = " (可重试)" if retryable else " (不可重试)"
+                        await cl.Message(content=f"❌ Agent 执行失败{retry_hint}：{msg}").send()
                         return
+
+                    if etype == "todo":
+                        # P26.5: brief inline status, don't create a Step
+                        continue
 
                     if etype == "status":
                         msg_text = data.get("message", "")
-                        if _status_step is None:
-                            _status_step = cl.Step(name=f"⏳ {msg_text}", type="tool")
-                            await _status_step.send()
+                        if not msg_text:
+                            continue
+                        if _status_msg is None:
+                            _status_msg = cl.Message(content=f"⏳ {msg_text}", author="system")
+                            await _status_msg.send()
                         else:
-                            _status_step.name = f"⏳ {msg_text}"
-                            await _status_step.update()
+                            _status_msg.content = f"⏳ {msg_text}"
+                            await _status_msg.update()
                         continue
 
                     if etype == "token":
@@ -356,13 +371,17 @@ async def on_message(msg: cl.Message):
                         continue
 
                     if etype == "done":
-                        if _status_step is not None:
-                            _status_step.name = "✅ 完成"
-                            await _status_step.update()
+                        if _status_msg is not None:
+                            try:
+                                await _status_msg.remove()
+                            except Exception:
+                                pass
+                            _status_msg = None
                         final_answer = data.get("answer", "")
                         final_citations = data.get("citations", [])
                         final_pages = data.get("retrieved_pages", [])
                         final_grounding_score = data.get("grounding_score", 1.0)
+                        final_unverified = data.get("unverified_claims", [])
                         new_conv_id = data.get("conv_id")
                         if new_conv_id:
                             cl.user_session.set("conv_id", new_conv_id)
@@ -372,11 +391,27 @@ async def on_message(msg: cl.Message):
                     summary = data.get("summary", "")
                     content = data.get("content", "")
 
-                    label = _NODE_LABELS.get(node, node)
-                    step_name = f"{label} · {_truncate(summary, 35)}"
+                    # Remove transient status message when real node output arrives
+                    if _status_msg is not None:
+                        try:
+                            await _status_msg.remove()
+                        except Exception:
+                            pass
+                        _status_msg = None
 
-                    async with cl.Step(name=step_name, type="tool") as step:
-                        step.output = content
+                    label = _NODE_LABELS.get(node, node)
+                    if summary:
+                        step_name = f"{label} · {_truncate(summary, 35)}"
+                    else:
+                        step_name = label
+
+                    # Only create step when there's something to show
+                    if content:
+                        async with cl.Step(name=step_name, type="tool") as step:
+                            step.output = content
+                    else:
+                        async with cl.Step(name=step_name, type="tool") as step:
+                            step.output = summary or "(无详情)"
 
     except httpx.ConnectError:
         await cl.Message(
@@ -394,13 +429,22 @@ async def on_message(msg: cl.Message):
     elements = _page_elements(final_pages)
     citations_md = _format_citations(final_citations)
 
+    # P23/P28: grounding score badge
+    grounding_badge = ""
+    if final_grounding_score < 0.95:
+        level = "🛑" if final_grounding_score < 0.7 else "⚠️"
+        grounding_badge = (
+            f"\n\n---\n{level} **校验可信度: {final_grounding_score:.0%}**"
+        )
+        if final_unverified:
+            grounding_badge += f" — {len(final_unverified)} 项引用/数值未匹配证据"
+
     if streaming_msg is not None:
-        # Tokens already on screen — append citations + attach page elements in place.
-        body = (final_answer or streamed_text) + citations_md
+        body = (final_answer or streamed_text) + grounding_badge + citations_md
         streaming_msg.content = body
         if elements:
             streaming_msg.elements = elements
         await streaming_msg.update()
     else:
-        answer = (final_answer or "*(空回答)*") + citations_md
+        answer = (final_answer or "*(空回答)*") + grounding_badge + citations_md
         await cl.Message(content=answer, elements=elements).send()

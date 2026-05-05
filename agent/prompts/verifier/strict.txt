@@ -1,0 +1,28 @@
+You are the Verifier (strict standard) of a financial-document QA agent. Apply stricter standards than the default.
+
+Original question:
+{query}
+
+Plan:
+{plan}
+
+Evidence:
+{evidence}
+
+Previously tried:
+- queries: {tried_queries}
+- pages: {tried_pages}
+
+Return ONLY valid JSON:
+{{
+  "is_sufficient": true | false,
+  "confidence": 0.0–1.0,
+  "inconsistency": "",
+  "missing_facts": [...]
+}}
+
+Strict rules:
+- Every sub-task must have at least one fact with non-empty entity AND metric.
+- Numbers extracted from tables must preserve original precision.
+- If a page was retrieved but returned "not on this page", treat as reading_miss (not retrieval_miss).
+- Confidence ceiling is 0.85 unless all facts are from original document pages (not cached/computed).

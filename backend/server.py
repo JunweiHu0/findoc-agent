@@ -59,31 +59,51 @@ def _summarize_node(node: str, delta: dict[str, Any]) -> str:
         if not plan:
             return "未生成计划"
         first = plan[0].sub_query if hasattr(plan[0], "sub_query") else str(plan[0])
-        return f"产出{len(plan)}步计划: {first}"
+        qc = delta.get("query_class", "")
+        qc_label = {"single_fact": "单事实", "cross_doc_compare": "跨文档对比",
+                     "multi_step_calc": "多步计算", "trend_analysis": "趋势分析"}.get(qc, "")
+        tag = f" [{qc_label}]" if qc_label else ""
+        return f"{len(plan)}步{tag}: {first}"
     if node == "executor":
         pages = len(delta.get("retrieved_pages") or [])
         facts = len(delta.get("extracted_facts") or [])
         cvs = len(delta.get("computed_values") or [])
-        return f"检索{pages}页 · 抽取{facts}事实 · 计算{cvs}"
+        errors = len(delta.get("error_log") or [])
+        err_str = f" {errors}错误" if errors else ""
+        return f"检索{pages}页 抽取{facts}事实 计算{cvs}{err_str}"
     if node == "verifier":
         confidence = delta.get("confidence", 0.5)
         if delta.get("is_sufficient"):
-            return f"✅ 充分 (置信{confidence:.0%})"
+            return f"充分 (置信{confidence:.0%})"
         missing = len(delta.get("missing_facts") or [])
-        return f"↻ 缺{missing}项 (置信{confidence:.0%})"
+        return f"缺{missing}项 (置信{confidence:.0%})"
+    if node == "plan_critic":
+        todo_updates = delta.get("todo_updates") or []
+        dropped = sum(1 for t in todo_updates if t.get("status") == "skipped")
+        if dropped:
+            return f"跳过{dropped}个失败任务"
+        return "计划无需修订"
     if node == "remediation":
-        return "🔧 差异化修复"
+        todo_updates = delta.get("todo_updates") or []
+        retries = sum(1 for t in todo_updates if t.get("attempt", 0) > 1)
+        added = len(delta.get("todo_items") or [])
+        parts = [f"+{added}步"] if added else []
+        if retries:
+            parts.append(f"{retries}重试")
+        return " ".join(parts) if parts else "修复"
     if node == "synthesizer":
         ans = delta.get("answer") or ""
         cites = len(delta.get("citations") or [])
-        return f"生成答案({len(ans)}字符 · {cites}引用)"
+        return f"生成答案({len(ans)}字符 {cites}引用)"
     if node == "grounding":
         score = delta.get("grounding_score", 1.0)
         unverified = len(delta.get("unverified_claims") or [])
-        if unverified == 0:
-            return "✅ 校验通过"
-        return f"⚠ 校验: {unverified}项未匹配"
-    return "完成"
+        if score >= 0.95:
+            return f"校验通过 ({score:.0%})"
+        elif score >= 0.7:
+            return f"{unverified}项未匹配 ({score:.0%})"
+        return f"{unverified}项严重 ({score:.0%})"
+    return ""
 
 
 def _format_delta(node: str, delta: dict[str, Any]) -> str:
@@ -99,13 +119,21 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
         plan = delta.get("plan") or []
         if not plan:
             return "*(空计划)*"
-        lines = [f"**执行计划** — {len(plan)} 步\n"]
+        qc = delta.get("query_class", "")
+        qc_label = {"single_fact": "单事实查询", "cross_doc_compare": "跨文档对比",
+                     "multi_step_calc": "多步计算", "trend_analysis": "趋势分析"}.get(qc, "")
+        header = f"**执行计划** — {len(plan)} 步"
+        if qc_label:
+            header += f" · {qc_label}"
+        lines = [header + "\n"]
         for i, task in enumerate(plan):
             sq = task.sub_query if hasattr(task, "sub_query") else str(task)
             td = getattr(task, "target_doc", None)
+            deps = getattr(task, "depends_on", None)
             target = f" `[{td}]`" if td else ""
+            dep_str = f" ⬅ {','.join(deps[:2])}" if deps else ""
             es = getattr(task, "expected_output_schema", "text")
-            lines.append(f"{i+1}. `{sq}`{target}  → *{es}*")
+            lines.append(f"{i+1}. `{sq}`{target}  → *{es}*{dep_str}")
         return "\n".join(lines)
 
     if node == "executor":
@@ -134,14 +162,49 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
 
     if node == "verifier":
         suff = "✅ 信息充分" if delta.get("is_sufficient") else "❌ 信息不充分"
-        miss = delta.get("missing_info") or ""
-        out = f"**判断**: {suff}"
-        if miss:
-            out += f"\n\n**缺失信息**: {miss}"
+        conf = delta.get("confidence", 0.5)
+        out = f"**判断**: {suff}  (置信度 {conf:.0%})"
+        missing = delta.get("missing_facts") or []
+        if missing:
+            out += f"\n\n**缺失项** ({len(missing)}):"
+            for mf in missing[:5]:
+                rc = mf.get("root_cause", "?")
+                what = mf.get("what", "?")
+                out += f"\n- [{rc}] {what}"
+            if len(missing) > 5:
+                out += f"\n- ... 等共 {len(missing)} 项"
         reflexion = delta.get("reflexion_iter")
         if reflexion is not None:
-            out += f"\n\n轮次: {reflexion}"
+            out += f"\n\nReflexion 轮次: {reflexion}"
         return out
+
+    if node == "plan_critic":
+        todo_updates = delta.get("todo_updates") or []
+        dropped = [t for t in todo_updates if t.get("status") == "skipped"]
+        plan_new = delta.get("plan") or []
+        out = "**计划评审**\n\n"
+        if dropped:
+            out += f"跳过失败任务: {', '.join(t.get('id','?') for t in dropped)}\n"
+        if plan_new:
+            out += f"修订后计划: {len(plan_new)} 步"
+        if not dropped and not plan_new:
+            out += "当前计划无需修订，继续执行。"
+        return out
+
+    if node == "remediation":
+        todo_items = delta.get("todo_items") or []
+        todo_updates = delta.get("todo_updates") or []
+        retries = sum(1 for t in todo_updates if t.get("attempt", 0) > 1)
+        lines = [f"**差异化修复** — 新增 {len(todo_items)} 步"]
+        if retries:
+            lines.append(f"，{retries} 次重试")
+        for ti in todo_items[:5]:
+            title = ti.get("title", "") if isinstance(ti, dict) else getattr(ti, "title", "")
+            attempt = ti.get("attempt", 0) if isinstance(ti, dict) else getattr(ti, "attempt", 0)
+            if title:
+                retry_tag = f" (第{attempt}次)" if attempt > 1 else ""
+                lines.append(f"\n- {title[:40]}{retry_tag}")
+        return "".join(lines)
 
     if node == "synthesizer":
         ans = delta.get("answer") or ""
@@ -153,7 +216,17 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
             )
         return out
 
-    return f"```json\n{json.dumps(delta, ensure_ascii=False, indent=2, default=str)}\n```"
+    if node == "grounding":
+        score = delta.get("grounding_score", 1.0)
+        unverified = delta.get("unverified_claims") or []
+        if not unverified:
+            return f"✅ 全部校验通过 ({score:.0%})"
+        lines = [f"**校验结果** — {len(unverified)} 项未匹配 (得分 {score:.0%})\n"]
+        for u in unverified[:5]:
+            lines.append(f"- `{u.get('text','?')}` — {u.get('reason','?')}")
+        return "\n".join(lines)
+
+    return ""
 
 
 # ---------------------------------------------------------------------------
@@ -185,6 +258,11 @@ def _initial_state(
         "grounding_score": 0.0,
         "fact_index": {},
         "known_facts": known_facts or [],
+        "error_log": [],
+        "todo_items": [],
+        "todo_updates": [],
+        "query_class": "",
+        "agent_profile": {},
     }
 
 
@@ -314,6 +392,7 @@ async def query(req: QueryRequest):
     node_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
     progress_queue: queue.Queue[str] = queue.Queue()
     token_queue: queue.Queue[str] = queue.Queue()  # P16: synthesizer streaming
+    todo_queue: queue.Queue[dict] = queue.Queue()  # P26.5: todo status updates
 
     def _on_progress(msg: str) -> None:
         progress_queue.put(msg)
@@ -376,6 +455,15 @@ async def query(req: QueryRequest):
                 except queue.Empty:
                     break
 
+            # Drain todo_updates (P26.5) from state delta
+            while True:
+                try:
+                    todo_update = todo_queue.get_nowait()
+                    payload = json.dumps(todo_update, ensure_ascii=False)
+                    yield f"event: todo\ndata: {payload}\n\n"
+                except queue.Empty:
+                    break
+
             # Drain node results
             try:
                 node_name, data = node_queue.get_nowait()
@@ -389,10 +477,18 @@ async def query(req: QueryRequest):
                 accumulated = data
                 break
             elif node_name == "__error__":
-                err = json.dumps({"type": "error", "message": data["message"]}, ensure_ascii=False)
+                err = json.dumps({
+                    "type": "error",
+                    "message": data["message"],
+                    "retryable": data.get("retryable", False),
+                }, ensure_ascii=False)
                 yield f"event: error\ndata: {err}\n\n"
                 thread.join()
                 return
+
+            # P26.5: push todo_updates from this node's delta to the todo queue
+            for tu in data.get("todo_updates") or []:
+                todo_queue.put(tu)
 
             # Normal node event
             summary = _summarize_node(node_name, data)

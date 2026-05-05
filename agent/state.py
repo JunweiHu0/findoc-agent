@@ -9,7 +9,32 @@ accumulate across reflexion loops without explicit merging.
 from operator import add
 from typing import Annotated, Literal, Optional, TypedDict
 
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
+
+
+class ErrorLogEntry(BaseModel):
+    """A single error record written by any node or tool (P26)."""
+    node: str = ""                      # which node reported the error
+    tool: str = ""                      # which tool failed (if applicable)
+    error_type: str = ""                # exception class name
+    message: str = ""                   # human-readable
+    retryable: bool = False
+    fatal: bool = False
+    timestamp: float = 0.0
+
+
+class TodoItem(BaseModel):
+    """Runtime task tracker linked to plan[i] (P26.5)."""
+    id: str = Field(default_factory=lambda: f"t-{__import__('uuid').uuid4().hex[:6]}")
+    sub_task_idx: int = 0
+    title: str = ""
+    status: Literal["pending", "running", "done", "failed", "skipped"] = "pending"
+    attempt: int = 0
+    error: Optional[str] = None
+    started_at: Optional[float] = None
+    finished_at: Optional[float] = None
+    parent_id: Optional[str] = None     # points to original todo on retry
+
 
 
 class SubTask(BaseModel):
@@ -17,7 +42,13 @@ class SubTask(BaseModel):
     sub_query: str
     target_doc: Optional[str] = None
     expected_output_schema: str = "text"
-    tool_calls: list[dict] = []  # P21: [{tool, args}] — takes priority over expected_output_schema when non-empty
+    tool_calls: list[dict] = []  # P21: [{tool, args}]
+    # P29: DAG fields
+    task_id: str = ""
+    depends_on: list[str] = []
+    priority: Literal[0, 1] = 0  # 0=core, 1=exploratory
+    status: Literal["pending", "running", "done", "failed"] = "pending"
+
 
 
 class PageHit(BaseModel):
@@ -101,6 +132,19 @@ class AgentState(TypedDict, total=False):
 
     # P25: facts carried over from previous conversation turns
     known_facts: list[dict]
+
+    # P26: error log for observability
+    error_log: Annotated[list[dict], add]
+
+    # P26.5: runtime todo tracking
+    todo_items: Annotated[list[dict], add]
+    todo_updates: Annotated[list[dict], add]
+
+    # P30: query classification for dynamic prompt selection
+    query_class: str
+
+    # P31: agent profile for specialist routing
+    agent_profile: dict
 
     # Final output
     answer: str

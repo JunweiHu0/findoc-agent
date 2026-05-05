@@ -3,23 +3,36 @@
 Evaluates whether the collected facts and computed values are sufficient to answer
 the user's query. When insufficient, produces structured MissingFact entries with
 root_cause classification to drive downstream remediation (P20).
+
+P31 Multi-Agent Parallel Verification:
+  For numeric/compare queries, runs 3 verifier instances (strict/standard/numeric)
+  in parallel via ThreadPoolExecutor. Majority vote determines is_sufficient.
+  Gated by query_class — only enabled for multi_step_calc and cross_doc_compare.
 """
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
 from loguru import logger
 
+from ..compression import compress_evidence
 from ..llm import get_llm, has_llm_key
 from ..prompts import load_prompt
+from ..retry import classify_error
 from ..schemas import VerifierOutput
 from ..state import AgentState, SubTask
 
 
 _PROMPT = load_prompt("verifier")
 
+# P31: Parallel verification gate — only enable for these query classes
+_PARALLEL_VERIFY_CLASSES = {"multi_step_calc", "cross_doc_compare"}
+_PARALLEL_VARIANTS = ["strict", "base", "numeric"]
+
 
 def verifier_node(state: AgentState) -> dict:
-    """Judge evidence sufficiency and cross-page consistency.
+    """Judge evidence sufficiency with optional P31 parallel voting.
 
     Returns a state delta with is_sufficient, confidence, and optional
     structured missing_facts for the remediation node to consume.
@@ -32,10 +45,29 @@ def verifier_node(state: AgentState) -> dict:
         logger.warning("DEEPSEEK_API_KEY not set — verifier uses plan-exhausted heuristic")
         return _heuristic(plan, cursor, iter_count)
 
-    # P19: structured missing_facts
+    qc = state.get("query_class", "")
+
+    # P31: Parallel verification gate
+    if qc in _PARALLEL_VERIFY_CLASSES and iter_count == 1:
+        return _parallel_verify(state, plan, cursor, iter_count, qc)
+
+    # Standard single-verifier path
+    return _single_verify(state, plan, cursor, iter_count, qc)
+
+
+def _single_verify(state: AgentState, plan: list, cursor: int,
+                   iter_count: int, query_class: str) -> dict:
+    """Standard single-verifier path (unchanged from P19 logic)."""
+    # P30: select verifier variant based on query_class
+    verifier_variant = "numeric" if query_class in ("multi_step_calc", "cross_doc_compare") else "base"
+    try:
+        variant_prompt = load_prompt("verifier", variant=verifier_variant)
+    except Exception:
+        variant_prompt = _PROMPT
+
     try:
         llm = get_llm("verifier").with_structured_output(VerifierOutput, method="json_mode")
-        prompt = _PROMPT.format(
+        prompt = variant_prompt.format(
             query=state["query"],
             plan=_render_plan(plan),
             evidence=_render_evidence(state),
@@ -44,14 +76,100 @@ def verifier_node(state: AgentState) -> dict:
         )
         result: VerifierOutput = llm.invoke(prompt)
     except Exception as e:
+        err = classify_error(e)
+        err["node"] = "verifier"
         logger.warning(f"verifier LLM call failed ({e}); using plan-exhausted heuristic")
+        h = _heuristic(plan, cursor, iter_count)
+        h["error_log"] = [err]
+        return h
+
+    return _build_result(state, result, plan, cursor, iter_count)
+
+
+def _parallel_verify(state: AgentState, plan: list, cursor: int,
+                     iter_count: int, query_class: str) -> dict:
+    """P31: Run 3 verifier instances in parallel, majority vote on sufficiency.
+
+    Variants: strict (stricter tolerance), base (standard), numeric (number-focused).
+    Results aggregated: sufficiency = majority vote, missing_facts = union deduped.
+    """
+    evidence = _render_evidence(state)
+    plan_text = _render_plan(plan)
+    tried_q = _render_tried(state, "tried_queries")
+    tried_p = _render_tried(state, "tried_pages")
+
+    def _run_one(variant: str) -> tuple[str, VerifierOutput | None, str | None]:
+        try:
+            prompt = load_prompt("verifier", variant=variant).format(
+                query=state["query"], plan=plan_text, evidence=evidence,
+                tried_queries=tried_q, tried_pages=tried_p,
+            )
+            llm = get_llm("verifier").with_structured_output(VerifierOutput, method="json_mode")
+            return (variant, llm.invoke(prompt), None)
+        except Exception as e:
+            return (variant, None, f"{type(e).__name__}: {e}")
+
+    results: dict[str, VerifierOutput] = {}
+    errors: list[dict] = []
+
+    with ThreadPoolExecutor(max_workers=3) as pool:
+        futures = {pool.submit(_run_one, v): v for v in _PARALLEL_VARIANTS}
+        for fut in as_completed(futures):
+            variant, result, error = fut.result()
+            if result is not None:
+                results[variant] = result
+            if error:
+                errors.append({"node": "verifier", "variant": variant, "error_type": error})
+
+    if not results:
+        logger.warning("parallel verify: all variants failed, using heuristic")
         return _heuristic(plan, cursor, iter_count)
 
-    # Collect tried markers from this cycle
+    # Majority vote on is_sufficient
+    votes = sum(1 for r in results.values() if r.is_sufficient)
+    total = len(results)
+    is_sufficient = votes > total / 2
+    confidence = votes / total
+
+    # Union of missing_facts, deduped by (sub_task_idx, root_cause)
+    seen = set()
+    all_missing: list[dict] = []
+    for r in results.values():
+        for mf in (r.missing_facts or []):
+            key = (mf.sub_task_idx, mf.root_cause)
+            if key not in seen:
+                seen.add(key)
+                all_missing.append(mf.model_dump())
+
+    # Inconsistency: non-empty if any variant reports one
+    inconsistencies = [r.inconsistency for r in results.values() if r.inconsistency]
+    inconsistency = "; ".join(inconsistencies[:2]) if inconsistencies else ""
+
+    logger.info(
+        f"parallel verify: {votes}/{total} sufficient, "
+        f"confidence={confidence:.2f}, missing={len(all_missing)}, errors={len(errors)}"
+    )
+
+    # Build synthetic VerifierOutput
+    synthetic = VerifierOutput(
+        is_sufficient=is_sufficient,
+        confidence=confidence,
+        inconsistency=inconsistency,
+        missing_facts=[],
+    )
+    result = _build_result(state, synthetic, plan, cursor, iter_count)
+    if errors:
+        result["error_log"] = result.get("error_log", []) + errors
+    return result
+
+
+def _build_result(state: AgentState, result: VerifierOutput, plan: list,
+                  cursor: int, iter_count: int) -> dict:
+    """Build the state delta from a VerifierOutput. Shared by single + parallel paths."""
     tried_queries = _collect_tried_queries(plan, cursor)
     tried_pages = _collect_tried_pages(state)
 
-    # P19: early-stop — no new facts gained in this reflexion round
+    # P19: early-stop
     prev_fact_count = _count_facts_before_cursor(state, cursor)
     if iter_count > 1 and prev_fact_count == len(state.get("extracted_facts") or []):
         logger.info("reflexion early-stop: no new facts gained this round; forcing synthesis")
@@ -63,7 +181,6 @@ def verifier_node(state: AgentState) -> dict:
             "tried_queries": tried_queries,
         }
 
-    # Build missing_facts dicts for state accumulation
     missing_dicts = [mf.model_dump() for mf in (result.missing_facts or [])]
 
     if result.is_sufficient and not result.inconsistency:
@@ -75,10 +192,8 @@ def verifier_node(state: AgentState) -> dict:
             "tried_queries": tried_queries,
         }
 
-    # Not sufficient — build follow-up SubTasks from structured missing_facts
     new_subtasks = _missing_facts_to_subtasks(result.missing_facts)
     if not new_subtasks:
-        # Fallback: use old missing_info string or inconsistency text
         fallback = result.inconsistency or getattr(result, "missing_info", "") or "需要更多证据"
         new_subtasks = [SubTask(sub_query=fallback)]
 
@@ -170,9 +285,18 @@ def _render_plan(plan: list[SubTask]) -> str:
 
 
 def _render_evidence(state: AgentState) -> str:
-    """Format extracted facts and computed values for the verifier prompt."""
-    facts = state.get("extracted_facts") or []
+    """Format extracted facts and computed values for the verifier prompt.
+    P27: applies compress_evidence when >10 facts or reflexion_iter > 0."""
+    raw_facts = state.get("extracted_facts") or []
     cvs = state.get("computed_values") or []
+
+    # P27: compress evidence when above threshold
+    reflexion = state.get("reflexion_iter", 0)
+    if len(raw_facts) > 10 or reflexion > 0:
+        facts = compress_evidence(raw_facts, query=state.get("query", ""))
+    else:
+        facts = raw_facts
+
     if not facts and not cvs:
         return "(no evidence yet)"
     lines = []
