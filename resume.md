@@ -11,31 +11,33 @@
 
 ---
 
-## 简历正文（三段式，~ 250 字，建议主用）
+## 简历正文（建议主用）
 
-> **FinDoc Agent · 面向金融年报的视觉检索 RAG Agent**　·　个人项目　·　Python / LangGraph / FastAPI / Qdrant
+> **FinDoc Agent · 金融年报多模态 RAG Agent**　·　个人项目　·　Python / LangGraph / FastAPI / Qdrant
 >
-> - **视觉检索绕过 OCR**：以 ColQwen2 多向量 + MaxSim 直检页面图像，保留表格/图表/数字精度；ViDoRe 上较 ColPali nDCG@5 提升 ~8pp（89% vs 81%）。设计 4 种部署组合（本地/远程 ColQwen × 内存/Qdrant MultiVector），Qdrant 异常自动 fallback，Agent 永不因向量库故障崩溃。
-> - **8 节点 LangGraph 状态机**：query_router（关键词+LLM 智能路由，闲聊直答跳过整条检索流水线）→ retrieval_scout（轻量 MaxSim top-3 候选文档）→ planner（两段式：query_class 分类 → 变体 prompt + few-shot 生成 DAG 计划，含 `$tN.value` 跨任务占位符）→ executor（DAG 拓扑分层 ThreadPool 并发 + 跨轮 known_facts 硬命中跳过检索+VLM）→ plan_critic（信号词/失败任务触发按需修订，cursor+iter 重入保护）→ verifier（数值/对比类查询 3 实例并行多数表决）→ remediation（按 4 类根因分派显式 tool_calls 差异化修复 + 三重预算降级保护）→ synthesizer（SSE 流式 token + 正则解析 `[doc p.N]` 引用并剥离虚构项）。
-> - **LLMCompiler 跨任务数据流**：DAG plan 中通过 `$tN.value` 占位符实现任务间数值传递；executor 在调用 calculator 前链式解析占位符（ComputedValue → Fact.value → Fact.text 兜底）；synthesizer prompt 硬约束"compute: 行的 value 是真值，禁止心算"。Few-shot 注入 3 个 DAG 示例（毛利率两阶段、跨公司对比、同比增速）。
-> - **结构化反思 + 根因诊断**：verifier 输出 pydantic `MissingFact` 含 `retrieval_miss / reading_miss / ambiguous_query / inconsistency` 4 类根因；remediation 按根因构造显式工具调用（`read_page_with_vlm` / `disambiguate_caliber`，不再是字符串前缀污染）；三重预算防死循环（iter=3 / retrieval=10 / vlm=20）。
-> - **三层语义记忆**：工作记忆（fact_index dict）→ 情景记忆（conv_facts + ColQwen 128d float16 embedding，cosine ≥ 0.85 硬命中跳过检索，0.5–0.85 软命中作检索先验）→ 语义记忆（hit_count ≥ 3 且 grounding_verified=1 晋升 global_facts 跨对话复用）。embedding 复用 ColQwen 文本编码器零额外依赖，模型未加载回退字符 n-gram。
-> - **可扩展能力体系**：工具注册表（ToolSpec 自描述 params/output schema，planner prompt 自动发现，新工具一行 `register`）+ YAML 技能注册表（trigger 关键词 O(1) 匹配 → 注入 plan_template / strategy / verifier 变体，跨 planner/executor/verifier 一致策略）。
-> - **健壮性与可观测性**：tenacity 指数退避（瞬时错误重试，401/400 立即失败避免烧 API 额度）+ 结构化 `error_log` + 运行时 `todo_items`（parent_id 串联重试链）+ TokenBudget 触发的上下文压缩（chat_history 正则摘要、evidence 按 entity/period/metric 去重）+ 引用校验正则解析后写回情景记忆驱动语义晋升。
-> - **工程交付**：FastAPI SSE 流式后端（event: status/token/node/todo/error/done 全部带 type 字段，前端按 `event:` 行主分派）+ Chainlit 前端（零 agent 代码耦合，纯 HTTP/SSE 边界）+ Qdrant Docker + Litserve ColQwen GPU 服务；已索引 14+ 份年报，30 题评测集覆盖 L1 单事实 / L2 单文档计算 / L3 跨文档对比三档复杂度。
+> - **绕开 OCR 做视觉检索**。ColQwen2 把每页年报编成 ~1024 个 128d patch 向量，MaxSim 晚交互保留 OCR 会破坏的表格/图表结构；ViDoRe nDCG@5 **89% vs ColPali 81%**。
+> - **Qdrant 原生 MultiVector 跑服务端 MaxSim**，对比 Chroma/Pinecone 仅支持单向量；`Distance.DOT` 对齐 Python einsum 语义。任何 Qdrant 异常自动降级到内存 MaxSim，向量库故障不传染 Agent。
+> - **用 LangGraph 8 节点状态机替代 ReAct 黑盒循环**：query_router → scout → planner → executor → plan_critic → verifier → remediation → synthesizer，每节点 I/O 可观测，反思循环走条件边显式管控；闲聊轮 query_router 直接跳过整条检索流水线，省检索/VLM 预算。
+> - **LLMCompiler 风格 DAG 执行**。Planner 产出含 `$tN.value` 跨任务占位符的计划，executor 拓扑分层 + ThreadPool 同层并发；calculator 是派生指标唯一来源，synthesizer prompt 硬约束 "`compute:` 行的 value 是真值，禁止心算"。
+> - **结构化 reflexion 取代自由文本反思**。Verifier 输出 pydantic `MissingFact[]` + 4 类 root_cause（retrieval_miss / reading_miss / ambiguous_query / inconsistency），remediation 按根因构造显式 tool_calls 而非字符串前缀 hack。三重预算（iter ≤ 3 / retrieval ≤ 10 / vlm ≤ 20）防死循环；数值题走 strict/base/numeric **3 实例并行多数表决**降低单点 LLM 误差。
+> - **三层记忆跨轮跳过检索**。Working dict → Episodic SQLite（复用 ColQwen 文本编码器做 128d float16 嵌入，零额外依赖）→ Semantic global；cosine ≥ 0.85 直接跳过检索+VLM，hit_count ≥ 3 且 grounding 通过的事实晋升跨对话复用。
+> - **零 LLM 做引用校验**。Synthesizer 后正则解析 `[doc p.N]`，对比 evidence 集合剥离虚构引用，只把模型真正引用过的页返前端。
+> - **工具/技能双注册表一行扩展**：ToolSpec 自描述 schema、planner prompt 自动发现；YAML 技能 trigger 关键词 O(1) 匹配注入 plan_template/strategy/verifier 变体。Tenacity 区分瞬时/致命错误（401 不重试），TokenBudget 自动压缩长上下文，结构化 `error_log` / `todo_items` 全链路可观测。
+> - **前后端零耦合**：FastAPI SSE（event 全带 type 字段，前端按 `event:` 行主分派）+ Chainlit 纯消费 SSE 边界，前端不 import 任何 agent 代码。已索引 14+ 份年报，30 题评测集覆盖 L1/L2/L3 三档复杂度。
 >
 > **技术栈**：Python · LangGraph · FastAPI SSE · Qdrant MultiVector · ColQwen2 + LoRA · DeepSeek API · Qwen VLM · Litserve · Chainlit · SQLite WAL · tenacity · pydantic
 
 ---
 
-## 极简版（适合空间紧张的简历，~ 4 bullet）
+## 极简版（适合空间紧张的简历，~ 5 bullet）
 
 > **FinDoc Agent · 金融文档多模态 RAG Agent**　·　个人项目
 >
-> - 用 ColQwen2 多向量 + MaxSim 直检页面图像绕过 OCR，保留表格/图表精度；4 种部署组合 + Qdrant 异常自动 fallback。
-> - LangGraph 8 节点状态机（智能路由→探查→DAG 规划→分层并发执行→计划评审→并行表决验证→根因驱动修复→流式合成含引用校验），LLMCompiler 风格 `$tN.value` 跨任务数据流 + 结构化反思 + 4 类根因诊断驱动显式工具调用 + 三重预算控制。
-> - 三层语义记忆（工作/情景/语义）：cosine 硬命中跳过检索，hit_count + grounding_verified 双条件晋升跨对话；embedding 复用 ColQwen 编码器零依赖。
-> - 工具/技能双注册表（自描述 + YAML 配置）+ tenacity 指数退避 + TokenBudget 自动压缩；FastAPI SSE + Chainlit 前后端零耦合。
+> - **视觉检索绕过 OCR**：ColQwen2 多向量 MaxSim 直检页面图像，保留表格/图表精度；Qdrant 原生 MultiVector 服务端 MaxSim + 4 种部署组合 + 自动 fallback。
+> - **LangGraph 8 节点状态机**：智能路由→探查→DAG 规划→分层并发执行→计划评审→并行表决验证→根因驱动修复→流式合成含引用校验，结构化反思 + 4 类根因诊断驱动显式工具调用 + 三重预算控制。
+> - **LLMCompiler 设计模式**：`$tN.value` 跨任务数据流 + 链式占位符解析 + synthesize 硬约束禁心算；3 个 DAG few-shot 示例跑满 compiler。
+> - **三层语义记忆**：工作/情景/语义；cosine 硬命中跳过检索，hit_count + grounding_verified 双条件晋升跨对话；embedding 复用 ColQwen 编码器零依赖。
+> - **工具/技能双注册表**（自描述 + YAML 配置）+ tenacity 指数退避 + TokenBudget 自动压缩；FastAPI SSE + Chainlit 前后端零耦合。
 
 ---
 

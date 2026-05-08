@@ -19,3 +19,4 @@ DEVLOG.md
 *.log
 wandb/
 .files/
+resume.md
