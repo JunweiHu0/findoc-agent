@@ -20,6 +20,7 @@ Return ONLY valid JSON:
 {{
   "plan": [
     {{
+      "task_id": "t1",
       "sub_query": "...",
       "target_doc": "doc_id or null",
       "expected_output_schema": "text",
@@ -31,7 +32,9 @@ Return ONLY valid JSON:
 }}
 
 Key rules:
-- Text sub-tasks come first, with sub_queries asking for specific numbers.
-- Number sub-tasks come after, with depends_on referencing the text sub-task IDs.
-- The final number sub-task MUST be a pure arithmetic expression.
-- If you cannot fill in the numbers at plan time, omit the number step — the executor will skip malformed expressions.
+- Give every SubTask a unique `task_id` (e.g. "t1", "t2"...).
+- Text sub-tasks come first, with sub_queries asking for specific numbers (one number per task).
+- The final number sub-task uses `$tN.value` placeholders to reference upstream outputs and lists those task_ids in `depends_on`.
+   - Example: `{{"task_id":"t3","sub_query":"($t1.value - $t2.value) / $t1.value * 100","depends_on":["t1","t2"],"expected_output_schema":"number"}}`
+   - Executor substitutes the placeholders with the structured numeric values extracted from t1/t2 right before running the calculator.
+- Always include the calculation step when the question asks for a derived metric. The calculator is the source of truth — never delegate arithmetic to natural language.

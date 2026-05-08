@@ -1,13 +1,9 @@
-"""Context compression (P27) — structured summarisation instead of brute truncation.
+"""Context compression — structured summarisation instead of brute truncation.
 
-Three primitives:
-  compress_history  — summarise chat_history when >3 turns or >800 tokens.
-  compress_evidence — deduplicate extracted_facts by (entity, period, metric).
-  TokenBudget       — per-node token caps; auto-trigger compression when exceeded.
-
-Design: compression itself costs ~200 tokens for the summary prompt but the
-downstream prompt savings are much larger. Discarded facts are not lost —
-they are written to episodic memory (P28) and can still be recalled.
+compress_history: summarise chat_history when >3 turns or >800 tokens.
+compress_evidence: deduplicate extracted_facts by (entity, period, metric).
+TokenBudget: per-node token caps; auto-trigger compression when exceeded.
+上下文压缩——结构化摘要替代暴力截断。超阈值自动触发压缩。
 """
 
 from __future__ import annotations
@@ -170,7 +166,7 @@ def compress_evidence(
     - For facts with the same (entity, period, metric), keep the one with
       the longest text (most detail).
     - Facts irrelevant to the query (no entity/metric overlap) are dropped
-      but their content is retained for episodic memory (P28).
+      but their content is retained for episodic memory / 内容保留在情景记忆中可召回。
 
     Args:
         facts: list of Fact objects or dicts with entity/period/metric/text fields.
@@ -219,7 +215,6 @@ def compress_evidence(
                 kept.append(f)
             elif not entity and not metric:
                 kept.append(f)  # unstructured but keep
-        # If we dropped too many, fall back to all indexed
         if len(kept) < len(indexed) * 0.5:
             kept = list(indexed.values())
     else:
@@ -229,7 +224,7 @@ def compress_evidence(
 
 
 def _field(obj, name: str) -> Optional[str]:
-    """Extract a field from a pydantic model or dict."""
+    """Extract a field from a pydantic model or dict / 从 pydantic 模型或 dict 提取字段。"""
     if hasattr(obj, name):
         return getattr(obj, name, None)
     if isinstance(obj, dict):

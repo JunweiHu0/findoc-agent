@@ -18,7 +18,6 @@ Previously tried:
 Return ONLY valid JSON:
 {{
   "is_sufficient": true | false,
-  "confidence": 0.0–1.0,
   "inconsistency": "",
   "missing_facts": [...]
 }}

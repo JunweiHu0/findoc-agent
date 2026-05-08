@@ -1,12 +1,4 @@
-"""Plan Critic node (P29) — on-demand plan revision.
-
-Triggered when:
-- extracted_facts contain signal words (口径变更/合并范围调整/重述会计政策)
-- any task failed (status="failed" in todo_items)
-
-Calls a ~200 token LLM to evaluate whether the remaining plan is still reasonable.
-Returns {revise, new_subtasks, drop_ids} for the executor to consume.
-"""
+"""Plan Critic node — on-demand plan revision triggered by signal words or task failures / 计划评审节点——由信号词或任务失败触发的按需计划修订。"""
 
 from __future__ import annotations
 
@@ -22,9 +14,12 @@ _SIGNAL_WORDS = [
     "会计估计变更", "前期差错更正", "分部报告", "终止经营",
 ]
 
+# Hard cap on plan_critic invocations to prevent runaway oscillation / plan_critic 调用硬上限，防止振荡
+_MAX_CRITIC_ITER = 2
+
 
 def _has_signal(facts: list) -> bool:
-    """Check if any fact text contains plan-revision signal words."""
+    """Check if any fact text contains plan-revision signal words / 检查事实文本是否含计划修订信号词。"""
     for f in facts:
         text = getattr(f, "text", "") or ""
         for sw in _SIGNAL_WORDS:
@@ -34,7 +29,7 @@ def _has_signal(facts: list) -> bool:
 
 
 def _has_failed(state: AgentState) -> bool:
-    """Check if any todo item has status=failed."""
+    """Check if any todo item has status=failed / 检查是否有 todo 项状态为 failed。"""
     todos = state.get("todo_items") or []
     for t in todos:
         status = t.get("status", "") if isinstance(t, dict) else getattr(t, "status", "")
@@ -44,19 +39,36 @@ def _has_failed(state: AgentState) -> bool:
 
 
 def _should_trigger(state: AgentState) -> bool:
-    """Determine whether plan_critic should be activated."""
+    """Determine whether plan_critic should activate / 判断是否应激活计划评审。
+
+    Guards against re-entry: plan_critic only fires when (1) signal/failure exists AND
+    (2) plan_cursor has advanced since last critique AND (3) iter cap not reached.
+    Both signals (extracted_facts and failed todos) are sticky — they never clear —
+    so without these guards executor → plan_critic → executor would oscillate.
+    重入保护：仅在游标推进且未达上限时触发，否则信号永远存在会导致振荡。"""
+    iter_count = state.get("plan_critic_iter", 0)
+    if iter_count >= _MAX_CRITIC_ITER:
+        return False
+
+    cursor = state.get("plan_cursor", 0)
+    last_cursor = state.get("plan_critic_last_cursor", -1)
+    if cursor <= last_cursor:
+        return False
+
     facts = state.get("extracted_facts") or []
     return _has_signal(facts) or _has_failed(state)
 
 
 def plan_critic_node(state: AgentState) -> dict:
-    """Evaluate remaining plan steps and suggest revisions if needed.
-
-    Only activates when signal words or task failures are detected.
-    Returns a state delta with revised plan or empty dict if no changes needed.
-    """
+    """Evaluate remaining plan steps and suggest revisions when signal words or failures are detected / 检测到信号词或失败时评估剩余计划步骤，建议修订。"""
     if not _should_trigger(state):
         return {}
+
+    # Always stamp guard fields so subsequent _should_trigger sees this run / 写入幂等保护字段
+    guard = {
+        "plan_critic_last_cursor": state.get("plan_cursor", 0),
+        "plan_critic_iter": state.get("plan_critic_iter", 0) + 1,
+    }
 
     plan = list(state.get("plan") or [])
     todos = state.get("todo_items") or []
@@ -74,7 +86,7 @@ def plan_critic_node(state: AgentState) -> dict:
     # Build remaining plan description
     remaining = [st for st in plan if getattr(st, "task_id", "") not in completed_ids]
     if not remaining:
-        return {}
+        return guard
 
     remaining_desc = "\n".join(
         f"- {getattr(st, 'task_id', '?')}: {st.sub_query}"
@@ -83,7 +95,7 @@ def plan_critic_node(state: AgentState) -> dict:
 
     if not has_llm_key():
         logger.info("plan_critic: no LLM key, skipping revision")
-        return {}
+        return guard
 
     try:
         llm = get_llm("planner")
@@ -115,10 +127,10 @@ def plan_critic_node(state: AgentState) -> dict:
                 parsed = json.loads(content)
         except (json.JSONDecodeError, ValueError):
             logger.warning(f"plan_critic: failed to parse LLM response: {content[:200]}")
-            return {}
+            return guard
 
         if not parsed.get("revise", False):
-            return {}
+            return guard
 
         # Build new SubTasks from the revision
         new_sts = []
@@ -135,15 +147,16 @@ def plan_critic_node(state: AgentState) -> dict:
 
         logger.info(f"plan_critic: revising plan — adding {len(new_sts)} tasks, dropping {len(drop_ids)}")
         return {
+            **guard,
             "plan": plan + new_sts,
             "todo_updates": todo_updates,
         }
 
     except Exception as e:
         logger.warning(f"plan_critic: LLM call failed ({e}), keeping original plan")
-        return {}
+        return guard
 
 
 def should_trigger_plan_critic(state: AgentState) -> bool:
-    """Condition function for graph edge: True → route to plan_critic."""
+    """Condition function for graph edge routing / 图边路由的条件函数。"""
     return _should_trigger(state)

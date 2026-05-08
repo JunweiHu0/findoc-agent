@@ -1,4 +1,4 @@
-"""Memory system (P28) — three-layer semantic fact memory.
+"""Memory system — three-layer semantic fact memory / 记忆系统——三层语义事实记忆。
 
 Layer 1 (Working):   fact_index dict lookup per query — already in executor.
 Layer 2 (Episodic):  conv_facts + 128d embedding, cosine similarity.
@@ -23,7 +23,7 @@ from typing import Optional
 # ---------------------------------------------------------------------------
 
 def cosine(a: list[float], b: list[float]) -> float:
-    """Cosine similarity between two equal-length vectors."""
+    """Cosine similarity between two equal-length vectors / 两个等长向量的余弦相似度。"""
     if not a or not b or len(a) != len(b):
         return 0.0
     dot = sum(x * y for x, y in zip(a, b))
@@ -39,10 +39,10 @@ def cosine(a: list[float], b: list[float]) -> float:
 # ---------------------------------------------------------------------------
 
 def _encode_text_lite(text: str) -> Optional[list[float]]:
-    """Encode a short text snippet as a 128-dim float vector.
+    """Encode a short text snippet as a 128-dim float vector / 将短文本编码为128维浮点向量。
 
     Tries the ColQwen text encoder first. Falls back to char-ngram sparse
-    vectors when the model is not loaded (cold start / no GPU).
+    vectors when the model is not loaded (cold start / no GPU) / 优先使用ColQwen文本编码器，模型未加载时回退到字符n-gram稀疏向量。
     """
     try:
         from tools.colpali_tool import _state as _tool_state, _ensure_model_loaded
@@ -66,7 +66,7 @@ def _encode_text_lite(text: str) -> Optional[list[float]]:
 
 
 def _ngram_hash(text: str, dim: int = 128, n: int = 2) -> list[float]:
-    """Build a sparse 128-dim vector from character n-grams."""
+    """Build a sparse 128-dim vector from character n-grams / 从字符n-gram构建稀疏128维向量。"""
     vec = [0.0] * dim
     text = text.strip().lower()
     for i in range(len(text) - n + 1):
@@ -94,12 +94,12 @@ def semantic_match(
     hard_threshold: float = HARD_THRESHOLD,
     soft_threshold: float = SOFT_THRESHOLD,
 ) -> dict:
-    """Match sub_query against known_facts using vector similarity.
+    """Match sub_query against known_facts using vector similarity / 使用向量相似度将子查询与已知事实匹配。
 
-    Returns:
+    Returns / 返回:
         {"hard_hits": [...], "soft_hits": [...], "best_score": float}
-        hard_hits: facts that are a strong enough match to skip retrieval.
-        soft_hits: facts that should be used as retrieval priors.
+        hard_hits: facts that are a strong enough match to skip retrieval / 匹配度足够高可跳过检索的事实。
+        soft_hits: facts that should be used as retrieval priors / 应作为检索先验使用的事实。
     """
     if not known_facts:
         return {"hard_hits": [], "soft_hits": [], "best_score": 0.0}
@@ -151,10 +151,10 @@ def semantic_match(
 # ---------------------------------------------------------------------------
 
 def maybe_promote_to_global(fact: dict, min_hits: int = 3) -> bool:
-    """Check if a fact qualifies for promotion to global_facts (L3).
+    """Check if a fact qualifies for promotion to global_facts (L3) / 检查事实是否符合提升至全局事实(L3)的条件。
 
-    Conditions: grounding_verified=1 AND hit_count >= min_hits.
-    Returns True if promoted.
+    Conditions: grounding_verified=1 AND hit_count >= min_hits / 条件: grounding_verified=1 且 hit_count >= min_hits。
+    Returns True if promoted / 提升成功返回 True。
     """
     verified = fact.get("grounding_verified", 0)
     hits = fact.get("hit_count", 0)

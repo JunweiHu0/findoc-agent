@@ -1,13 +1,10 @@
-"""Verifier node — judges evidence sufficiency + consistency (P19: structured root-cause output).
+"""Verifier node — judges evidence sufficiency with optional parallel voting / 验证节点——充分性判断，支持并行多数表决。
 
 Evaluates whether the collected facts and computed values are sufficient to answer
-the user's query. When insufficient, produces structured MissingFact entries with
-root_cause classification to drive downstream remediation (P20).
-
-P31 Multi-Agent Parallel Verification:
-  For numeric/compare queries, runs 3 verifier instances (strict/standard/numeric)
-  in parallel via ThreadPoolExecutor. Majority vote determines is_sufficient.
-  Gated by query_class — only enabled for multi_step_calc and cross_doc_compare.
+the user's query. For numeric/compare queries, runs 3 instances in parallel and
+uses majority vote. When insufficient, produces structured MissingFact entries with
+root_cause classification to drive remediation.
+评估证据充分性。数值/对比查询启用 3 实例并行多数表决。不充分时产出结构化缺失信息。
 """
 
 from __future__ import annotations
@@ -26,17 +23,17 @@ from ..state import AgentState, SubTask
 
 _PROMPT = load_prompt("verifier")
 
-# P31: Parallel verification gate — only enable for these query classes
+# Query classes eligible for parallel verification / 可启用并行验证的查询类别
 _PARALLEL_VERIFY_CLASSES = {"multi_step_calc", "cross_doc_compare"}
 _PARALLEL_VARIANTS = ["strict", "base", "numeric"]
 
 
 def verifier_node(state: AgentState) -> dict:
-    """Judge evidence sufficiency with optional P31 parallel voting.
+    """Judge evidence sufficiency with optional parallel voting / 判断证据充分性，可选并行投票。
 
-    Returns a state delta with is_sufficient, confidence, and optional
-    structured missing_facts for the remediation node to consume.
-    """
+    Returns a state delta with is_sufficient and optional structured
+    missing_facts for the remediation node to consume.
+    返回含 is_sufficient/missing_facts 的状态增量。"""
     iter_count = state.get("reflexion_iter", 0) + 1
     plan = state.get("plan") or []
     cursor = state.get("plan_cursor", 0)
@@ -47,18 +44,18 @@ def verifier_node(state: AgentState) -> dict:
 
     qc = state.get("query_class", "")
 
-    # P31: Parallel verification gate
+    # Parallel verification gate / 并行验证门控
     if qc in _PARALLEL_VERIFY_CLASSES and iter_count == 1:
         return _parallel_verify(state, plan, cursor, iter_count, qc)
 
-    # Standard single-verifier path
+    # Standard single-verifier path / 标准单实例路径
     return _single_verify(state, plan, cursor, iter_count, qc)
 
 
 def _single_verify(state: AgentState, plan: list, cursor: int,
                    iter_count: int, query_class: str) -> dict:
-    """Standard single-verifier path (unchanged from P19 logic)."""
-    # P30: select verifier variant based on query_class
+    """Standard single-verifier path / 标准单实例验证路径。"""
+    # Select verifier variant based on query classification / 根据查询分类选验证器变体
     verifier_variant = "numeric" if query_class in ("multi_step_calc", "cross_doc_compare") else "base"
     try:
         variant_prompt = load_prompt("verifier", variant=verifier_variant)
@@ -88,11 +85,11 @@ def _single_verify(state: AgentState, plan: list, cursor: int,
 
 def _parallel_verify(state: AgentState, plan: list, cursor: int,
                      iter_count: int, query_class: str) -> dict:
-    """P31: Run 3 verifier instances in parallel, majority vote on sufficiency.
+    """Run 3 verifier instances in parallel, majority vote on sufficiency / 3 实例并行验证，多数表决。
 
     Variants: strict (stricter tolerance), base (standard), numeric (number-focused).
     Results aggregated: sufficiency = majority vote, missing_facts = union deduped.
-    """
+    strict/base/numeric 三个变体并行，结果聚合：充分性=多数表决，缺失项=并集去重。"""
     evidence = _render_evidence(state)
     plan_text = _render_plan(plan)
     tried_q = _render_tried(state, "tried_queries")
@@ -129,7 +126,6 @@ def _parallel_verify(state: AgentState, plan: list, cursor: int,
     votes = sum(1 for r in results.values() if r.is_sufficient)
     total = len(results)
     is_sufficient = votes > total / 2
-    confidence = votes / total
 
     # Union of missing_facts, deduped by (sub_task_idx, root_cause)
     seen = set()
@@ -147,13 +143,12 @@ def _parallel_verify(state: AgentState, plan: list, cursor: int,
 
     logger.info(
         f"parallel verify: {votes}/{total} sufficient, "
-        f"confidence={confidence:.2f}, missing={len(all_missing)}, errors={len(errors)}"
+        f"missing={len(all_missing)}, errors={len(errors)}"
     )
 
     # Build synthetic VerifierOutput
     synthetic = VerifierOutput(
         is_sufficient=is_sufficient,
-        confidence=confidence,
         inconsistency=inconsistency,
         missing_facts=[],
     )
@@ -165,18 +160,18 @@ def _parallel_verify(state: AgentState, plan: list, cursor: int,
 
 def _build_result(state: AgentState, result: VerifierOutput, plan: list,
                   cursor: int, iter_count: int) -> dict:
-    """Build the state delta from a VerifierOutput. Shared by single + parallel paths."""
+    """Build the state delta from a VerifierOutput. Shared by single + parallel paths.
+    从 VerifierOutput 构建状态增量，单实例和并行路径共享。"""
     tried_queries = _collect_tried_queries(plan, cursor)
     tried_pages = _collect_tried_pages(state)
 
-    # P19: early-stop
+    # Early-stop check / 早停检查
     prev_fact_count = _count_facts_before_cursor(state, cursor)
     if iter_count > 1 and prev_fact_count == len(state.get("extracted_facts") or []):
         logger.info("reflexion early-stop: no new facts gained this round; forcing synthesis")
         return {
             "reflexion_iter": iter_count,
             "is_sufficient": True,
-            "confidence": 0.3,
             "missing_facts": [],
             "tried_queries": tried_queries,
         }
@@ -187,7 +182,6 @@ def _build_result(state: AgentState, result: VerifierOutput, plan: list,
         return {
             "reflexion_iter": iter_count,
             "is_sufficient": True,
-            "confidence": result.confidence,
             "missing_facts": [],
             "tried_queries": tried_queries,
         }
@@ -202,7 +196,6 @@ def _build_result(state: AgentState, result: VerifierOutput, plan: list,
         "plan": new_plan,
         "reflexion_iter": iter_count,
         "is_sufficient": False,
-        "confidence": result.confidence,
         "missing_facts": missing_dicts,
         "tried_queries": tried_queries,
         "tried_pages": tried_pages,
@@ -211,10 +204,9 @@ def _build_result(state: AgentState, result: VerifierOutput, plan: list,
 
 def _missing_facts_to_subtasks(missing_facts: list) -> list[SubTask]:
     """Convert structured MissingFact list into SubTasks for the executor.
-
-    At P19, all root_causes map to a retrieval+VLM SubTask (the basic path).
-    P20 remediation_node later applies differentiated strategies.
-    """
+    将结构化 MissingFact 列表转换为 executor 的 SubTask。
+    All root_causes map to a retrieval+VLM SubTask; remediation applies differentiated strategies.
+    所有根因先映射为检索+VLM 子任务，remediation 后续分派差异化策略。"""
     out: list[SubTask] = []
     for mf in (missing_facts or []):
         query = mf.suggested_query or mf.what
@@ -228,7 +220,7 @@ def _missing_facts_to_subtasks(missing_facts: list) -> list[SubTask]:
 
 
 def _count_facts_before_cursor(state: AgentState, cursor: int) -> int:
-    """Count extracted_facts whose sub_task_idx < cursor (facts from prior rounds)."""
+    """Count facts from prior reflexion rounds / 统计之前反射轮次的事实数。"""
     facts = state.get("extracted_facts") or []
     return sum(1 for f in facts if (f.sub_task_idx or 0) < cursor)
 
@@ -268,7 +260,6 @@ def _heuristic(plan: list[SubTask], cursor: int, iter_count: int) -> dict:
     return {
         "reflexion_iter": iter_count,
         "is_sufficient": sufficient,
-        "confidence": 0.5 if sufficient else 0.3,
         "missing_facts": [],
         "missing_info": "" if sufficient else "plan not yet exhausted",
     }
@@ -286,11 +277,11 @@ def _render_plan(plan: list[SubTask]) -> str:
 
 def _render_evidence(state: AgentState) -> str:
     """Format extracted facts and computed values for the verifier prompt.
-    P27: applies compress_evidence when >10 facts or reflexion_iter > 0."""
+    格式化事实和计算值为 verifier prompt。Applies compress_evidence when >10 facts or reflexion > 0。"""
     raw_facts = state.get("extracted_facts") or []
     cvs = state.get("computed_values") or []
 
-    # P27: compress evidence when above threshold
+    # Compress evidence when above threshold / 超阈值时压缩证据
     reflexion = state.get("reflexion_iter", 0)
     if len(raw_facts) > 10 or reflexion > 0:
         facts = compress_evidence(raw_facts, query=state.get("query", ""))
@@ -301,7 +292,7 @@ def _render_evidence(state: AgentState) -> str:
         return "(no evidence yet)"
     lines = []
     for f in facts:
-        # P24: include structured keys when available
+        # Include structured keys when available / 有结构化字段时包含
         extra = ""
         if f.entity or f.metric:
             extra_parts = []

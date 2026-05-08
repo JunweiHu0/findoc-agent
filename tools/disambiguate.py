@@ -1,4 +1,4 @@
-"""Caliber disambiguation tool (P20).
+"""Caliber disambiguation tool / 口径消歧工具。
 
 When Verifier detects cross-page numerical inconsistency, this tool:
 1. Re-reads the conflicting pages with a caliber-focused VLM instruction
@@ -19,7 +19,7 @@ def disambiguate_caliber(
     conflict_topic: str,
     vlm_read_fn: "callable | None" = None,
 ) -> dict:
-    """Resolve a cross-page numerical conflict by extracting caliber metadata.
+    """Resolve a cross-page numerical conflict by extracting caliber metadata / 通过提取披露口径元数据解析跨页数据冲突。
 
     Args:
         facts: The conflicting Fact objects (should be 2+). Each must have

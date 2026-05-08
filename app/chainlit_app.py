@@ -6,10 +6,10 @@ Run:
 Requires the FastAPI backend running (default http://localhost:8001).
 All agent logic, retrieval, VLM calls, persistence happen in the backend.
 
-P13: left-sidebar conversation history via custom DataLayer bridging to
+Left-sidebar conversation history / 左侧栏对话历史 via custom DataLayer bridging to
 backend SQLite (see app/data_layer.py).
 
-P14: "+ attach" button on the left of the chat input (Chainlit
+File upload button — attached PDFs get indexed and searchable / 文件上传按钮 on the left of the chat input (Chainlit
 spontaneous_file_upload). Attached PDFs/images upload to the backend,
 get encoded with ColQwen2, and become queryable in the same chat turn.
 """
@@ -34,6 +34,7 @@ from app.data_layer import FinDocDataLayer
 _BACKEND_URL = CONFIG.get("backend", {}).get("url", "http://localhost:8001")
 
 _NODE_LABELS: dict[str, str] = {
+    "query_router": "\U0001f9ed Router",
     "retrieval_scout": "\U0001f50e Scout",
     "planner": "\U0001f9e0 Planner",
     "executor": "\U0001f4e5 Executor",
@@ -41,14 +42,13 @@ _NODE_LABELS: dict[str, str] = {
     "verifier": "\U0001f50d Verifier",
     "remediation": "\U0001f6e0 Fix",
     "synthesizer": "✏️ Synthesizer",
-    "grounding": "\U0001f4cb Grounding",
 }
 
 _UPLOAD_ACCEPT_SUFFIXES = {".pdf", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".gif", ".webp"}
 
 
 # ---------------------------------------------------------------------------
-# Chainlit data layer + auth (P13: enable threads sidebar)
+# Chainlit data layer + auth (Enable threads sidebar / 启用对话线程侧栏)
 # ---------------------------------------------------------------------------
 @cl.data_layer
 def _get_data_layer():
@@ -73,6 +73,32 @@ def _truncate(text: str, n: int = 35) -> str:
 def _resolve_page_image(doc_id: str, page_num: int) -> str | None:
     candidate = PAGES_DIR / doc_id / f"p{page_num:03d}.png"
     return str(candidate) if candidate.exists() else None
+
+
+_TODO_STATUS_GLYPH = {
+    "pending": "⏳",
+    "running": "🔄",
+    "done": "✅",
+    "failed": "❌",
+    "skipped": "⏭️",
+}
+
+
+def _render_todo_list(todo_state: dict[str, dict]) -> str:
+    """Render the accumulated todo dict as a markdown checklist / 渲染聚合的 todo 字典为 checklist。"""
+    if not todo_state:
+        return "*(暂无任务)*"
+    lines = ["**🗒 任务清单**\n"]
+    for tid, td in todo_state.items():
+        status = td.get("status", "pending")
+        glyph = _TODO_STATUS_GLYPH.get(status, "•")
+        title = td.get("title") or td.get("id", tid)
+        attempt = td.get("attempt", 0)
+        attempt_tag = f" (第{attempt}次)" if isinstance(attempt, int) and attempt > 1 else ""
+        err = td.get("error")
+        err_tag = f" — `{str(err)[:60]}`" if err else ""
+        lines.append(f"- {glyph} {title}{attempt_tag}{err_tag}")
+    return "\n".join(lines)
 
 
 def _format_citations(citations: list[dict]) -> str:
@@ -103,7 +129,7 @@ def _page_elements(pages: list[dict]) -> list[cl.Image]:
 
 
 # ---------------------------------------------------------------------------
-# P14: Inline upload — drains attachments from a Chainlit message and pushes
+# Inline upload — drains attachments and indexes / 内联上传
 # each through the backend upload pipeline. Returns the list of doc_ids
 # successfully indexed (so they can be referenced in the same turn's query).
 # ---------------------------------------------------------------------------
@@ -266,7 +292,7 @@ async def on_chat_resume(thread):
 
 @cl.on_message
 async def on_message(msg: cl.Message):
-    # P14 — drain any attached files first, build doc_filter from successful uploads
+    # Drain attached files / 处理附件
     new_doc_ids = await _handle_inline_uploads(msg)
 
     accumulated_doc_ids: list[str] = list(cl.user_session.get("uploaded_doc_ids") or [])
@@ -298,10 +324,13 @@ async def on_message(msg: cl.Message):
     final_answer = ""
     final_citations: list[dict] = []
     final_pages: list[dict] = []
-    final_grounding_score: float = 1.0
-    final_unverified: list[dict] = []
-    streaming_msg: cl.Message | None = None  # P16: token-by-token typewriter
+    streaming_msg: cl.Message | None = None  # Token-by-token streaming / 逐 token 流式
     streamed_text = ""
+
+    # TodoList sidebar state — accumulate todo events into a single live message
+    # 累积 todo 事件到一条可更新的消息，作为执行进度清单
+    todo_msg: cl.Message | None = None
+    todo_state: dict[str, dict] = {}  # id → todo dict (latest snapshot)
 
     body: dict = {"query": query}
     if conv_id:
@@ -322,8 +351,24 @@ async def on_message(msg: cl.Message):
                     await cl.Message(content=f"❌ 后端返回 {resp.status_code}: {err_text.decode()}").send()
                     return
 
-                async for line in resp.aiter_lines():
+                # Track current SSE event name across consecutive lines.
+                # Standard SSE: "event: <name>\ndata: <payload>\n\n". httpx.aiter_lines
+                # yields one line at a time; we remember the last event: name to
+                # interpret the subsequent data: payload.
+                # 标准 SSE 由多行组成，前端按行流式读入，需保留 event: 名以判别后续 data:。
+                current_event = ""
+                async for raw_line in resp.aiter_lines():
+                    line = raw_line.rstrip("\r")
+                    if line.startswith(":"):
+                        # SSE comment / keepalive — ignore
+                        continue
+                    if line.startswith("event:"):
+                        current_event = line[len("event:"):].strip()
+                        continue
                     if not line.startswith("data:"):
+                        # Empty line marks end-of-event; reset name
+                        if line == "":
+                            current_event = ""
                         continue
                     payload_str = line[5:].strip()
                     if not payload_str:
@@ -334,7 +379,9 @@ async def on_message(msg: cl.Message):
                     except json.JSONDecodeError:
                         continue
 
-                    etype = data.get("type", "")
+                    # Prefer the SSE event name; fall back to the in-payload type field.
+                    # 优先用 SSE event 名，回退到 payload.type
+                    etype = current_event or data.get("type", "")
 
                     if etype == "error":
                         msg = data.get('message', '未知错误')
@@ -344,7 +391,20 @@ async def on_message(msg: cl.Message):
                         return
 
                     if etype == "todo":
-                        # P26.5: brief inline status, don't create a Step
+                        # Live task checklist — accumulate by id and render as a single updating message.
+                        # 实时任务清单——按 id 聚合，渲染为一条可更新的消息
+                        tid = data.get("id", "")
+                        if tid:
+                            existing = todo_state.get(tid, {})
+                            existing.update(data)
+                            todo_state[tid] = existing
+                        rendered = _render_todo_list(todo_state)
+                        if todo_msg is None:
+                            todo_msg = cl.Message(content=rendered, author="system")
+                            await todo_msg.send()
+                        else:
+                            todo_msg.content = rendered
+                            await todo_msg.update()
                         continue
 
                     if etype == "status":
@@ -380,8 +440,6 @@ async def on_message(msg: cl.Message):
                         final_answer = data.get("answer", "")
                         final_citations = data.get("citations", [])
                         final_pages = data.get("retrieved_pages", [])
-                        final_grounding_score = data.get("grounding_score", 1.0)
-                        final_unverified = data.get("unverified_claims", [])
                         new_conv_id = data.get("conv_id")
                         if new_conv_id:
                             cl.user_session.set("conv_id", new_conv_id)
@@ -399,6 +457,13 @@ async def on_message(msg: cl.Message):
                             pass
                         _status_msg = None
 
+                    # Skip synthesizer's full-text step when token streaming is active —
+                    # the answer is already rendered in the streaming bubble; rendering
+                    # it again as a step is redundant and looks like duplicate output.
+                    # 流式渲染答案时跳过 synthesizer 节点的步骤，避免重复显示
+                    if node == "synthesizer" and streaming_msg is not None:
+                        continue
+
                     label = _NODE_LABELS.get(node, node)
                     if summary:
                         step_name = f"{label} · {_truncate(summary, 35)}"
@@ -406,12 +471,8 @@ async def on_message(msg: cl.Message):
                         step_name = label
 
                     # Only create step when there's something to show
-                    if content:
-                        async with cl.Step(name=step_name, type="tool") as step:
-                            step.output = content
-                    else:
-                        async with cl.Step(name=step_name, type="tool") as step:
-                            step.output = summary or "(无详情)"
+                    async with cl.Step(name=step_name, type="tool") as step:
+                        step.output = content or summary or "(无详情)"
 
     except httpx.ConnectError:
         await cl.Message(
@@ -429,22 +490,12 @@ async def on_message(msg: cl.Message):
     elements = _page_elements(final_pages)
     citations_md = _format_citations(final_citations)
 
-    # P23/P28: grounding score badge
-    grounding_badge = ""
-    if final_grounding_score < 0.95:
-        level = "🛑" if final_grounding_score < 0.7 else "⚠️"
-        grounding_badge = (
-            f"\n\n---\n{level} **校验可信度: {final_grounding_score:.0%}**"
-        )
-        if final_unverified:
-            grounding_badge += f" — {len(final_unverified)} 项引用/数值未匹配证据"
-
     if streaming_msg is not None:
-        body = (final_answer or streamed_text) + grounding_badge + citations_md
+        body = (final_answer or streamed_text) + citations_md
         streaming_msg.content = body
         if elements:
             streaming_msg.elements = elements
         await streaming_msg.update()
     else:
-        answer = (final_answer or "*(空回答)*") + grounding_badge + citations_md
+        answer = (final_answer or "*(空回答)*") + citations_md
         await cl.Message(content=answer, elements=elements).send()

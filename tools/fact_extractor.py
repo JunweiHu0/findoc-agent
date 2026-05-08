@@ -1,4 +1,4 @@
-"""Structured fact extraction (P24).
+"""Structured fact extraction / 结构化事实提取工具。
 
 Extracts entity, period, metric, value, and unit from free-text Fact entries
 using regex patterns specialized for Chinese financial documents.
@@ -62,7 +62,7 @@ _TABLE_ROW_RE = re.compile(r"^\s*\|.+\|.*\|\s*$")
 
 
 def extract_structured_facts(facts: list[Fact]) -> list[Fact]:
-    """Enrich each Fact with structured entity/period/metric/value/unit fields.
+    """Enrich each Fact with structured entity/period/metric/value/unit fields / 为每个事实补充结构化字段（实体/期间/指标/数值/单位）。
 
     Returns the same list with modified Fact objects (in-place mutation for
     efficiency — the caller owns the list).
@@ -76,6 +76,7 @@ def extract_structured_facts(facts: list[Fact]) -> list[Fact]:
 
 
 def _extract_one(fact: Fact) -> None:
+    """Extract structured fields from a single Fact / 从单个事实中提取结构化字段。"""
     text = fact.text
 
     # Entity: use source_doc as a hint, then regex
@@ -205,7 +206,7 @@ def _extract_value_unit(text: str) -> tuple[float | None, str | None]:
 
 
 def build_fact_index(facts: list[Fact]) -> dict:
-    """Build a lookup index from extracted_facts keyed by (entity, period, metric).
+    """Build a lookup index from extracted_facts keyed by (entity, period, metric) / 以 (实体, 期间, 指标) 为键构建事实查找索引。
 
     Used by verifier to mechanically check "do we already have (茅台, 2023, 毛利率)?"
     """

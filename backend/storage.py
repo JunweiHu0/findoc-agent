@@ -1,8 +1,8 @@
 """SQLite-backed persistence for conversations, messages, and documents.
 
 Single database file: data/findoc.db (WAL mode, thread-safe).
-Used by the backend server for conversation history (P13) and
-document registry (P14).
+Used by the backend server for conversation history and document registry.
+供后端服务使用的对话历史和文档注册持久化。
 """
 
 from __future__ import annotations
@@ -64,7 +64,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
             created_at REAL NOT NULL
         );
 
-        -- P25: cross-turn fact memory (P28: upgraded with embedding + verification)
+        -- Cross-turn fact memory (upgraded with embedding + verification) / 跨轮事实记忆（含 embedding + 验证升级）
         CREATE TABLE IF NOT EXISTS conv_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -82,7 +82,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_conv_facts_lookup
             ON conv_facts(conv_id, entity, period, metric);
 
-        -- P26.5: runtime todo tracking (one JSON blob per turn)
+        -- Runtime todo tracking (one JSON blob per turn) / 运行时任务追踪（每轮一个 JSON blob）
         CREATE TABLE IF NOT EXISTS turn_todos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             conv_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
@@ -94,7 +94,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_turn_todos_conv
             ON turn_todos(conv_id, turn_id);
 
-        -- P28: global cross-conversation fact memory
+        -- Global cross-conversation fact memory / 全局跨对话事实记忆
         CREATE TABLE IF NOT EXISTS global_facts (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             entity TEXT DEFAULT '',
@@ -121,7 +121,7 @@ def _ensure_tables(conn: sqlite3.Connection) -> None:
 
 
 def _migrate_schema(conn: sqlite3.Connection) -> None:
-    """Add columns added post-P25 if they don't exist (idempotent)."""
+    """Add new columns if they don't exist (idempotent) / 添加新列（幂等）。"""
     migrations = [
         "ALTER TABLE conv_facts ADD COLUMN fact_embedding BLOB",
         "ALTER TABLE conv_facts ADD COLUMN grounding_verified INTEGER DEFAULT 0",
@@ -305,7 +305,7 @@ def get_messages(conv_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# Documents (P14)
+# Documents / 文档
 # ---------------------------------------------------------------------------
 
 def add_document(doc_id: str, source_filename: str, page_count: int = 0,
@@ -367,7 +367,7 @@ def delete_document(doc_id: str) -> bool:
 
 
 # ---------------------------------------------------------------------------
-# P25: Cross-turn fact memory
+# Cross-turn fact memory / 跨轮事实记忆
 # ---------------------------------------------------------------------------
 
 def save_conv_facts(conv_id: str, facts: list[dict]) -> None:
@@ -407,7 +407,7 @@ def save_conv_facts(conv_id: str, facts: list[dict]) -> None:
 
 
 def save_conv_facts_enriched(conv_id: str, facts: list[dict], embeddings: list | None = None) -> None:
-    """Save structured facts with optional embeddings (P28)."""
+    """Save structured facts with optional embeddings / 保存带可选 embedding 的结构化事实。"""
     if not conv_id or not facts:
         return
     now = time.time()
@@ -467,7 +467,7 @@ def load_conv_facts(conv_id: str) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# P26.5: Turn todo persistence
+# Turn todo persistence / 轮次任务持久化
 # ---------------------------------------------------------------------------
 
 def save_turn_todos(conv_id: str, turn_id: int, items: list[dict]) -> None:
@@ -507,7 +507,7 @@ def load_turn_todos(conv_id: str, turn_id: int) -> list[dict]:
 
 
 # ---------------------------------------------------------------------------
-# P28: Global facts (cross-conversation semantic memory)
+# Global facts — cross-conversation semantic memory / 全局事实——跨对话语义记忆
 # ---------------------------------------------------------------------------
 
 def upsert_global_fact(fact: dict) -> None:
@@ -581,7 +581,7 @@ def load_global_facts(entity: str = "", period: str = "", metric: str = "", min_
 
 
 def mark_conv_fact_verified(fact_id: int, verified: bool = True) -> None:
-    """Mark a conv_fact as grounding-verified or tainted (P28 feedback loop)."""
+    """Mark a conv_fact as grounding-verified or tainted / 标记 conv_fact 为已验证或污染。"""
     with _lock:
         conn = _get_conn()
         if verified:

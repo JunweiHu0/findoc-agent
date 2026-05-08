@@ -11,7 +11,7 @@ name is kept as `colpali_tool.py` purely so the agent's import path stays stable
 the technique (multi-vector + late interaction) is identical.
 
 Falls back to a deterministic mock when no index files exist under data/index/,
-so the agent skeleton remains runnable before P2 has been executed.
+so the agent skeleton remains runnable before ingestion has been executed / 在数据摄取完成前。
 """
 from __future__ import annotations
 
@@ -88,6 +88,7 @@ def _ensure_model_loaded() -> None:
 
 
 def _ensure_loaded() -> bool:
+    """Ensure indexes and model are loaded / 确保索引和模型已加载。"""
     if _state["indexes"] is not None:
         return bool(_state["indexes"])
     indexes = _load_indexes()
@@ -100,12 +101,12 @@ def _ensure_loaded() -> bool:
 
 
 def preload() -> bool:
-    """Eagerly load indexes and model. Call at startup to eliminate first-request cold start."""
+    """Eagerly load indexes and model. Call at startup to eliminate first-request cold start / 预加载索引和模型，启动时调用以消除首次请求的冷启动延迟。"""
     return _ensure_loaded()
 
 
 def _encode_query_remote(query: str) -> "torch.Tensor | None":
-    """Encode query via ColQwen Service. Returns None on failure."""
+    """Encode query via ColQwen Service. Returns None on failure / 通过 ColQwen 服务编码查询，失败时返回 None。"""
     import httpx
     from agent.retry import with_retry as _retry
 
@@ -133,6 +134,7 @@ def _encode_query_remote(query: str) -> "torch.Tensor | None":
 
 
 def _encode_query(query: str) -> torch.Tensor:
+    """Encode query with remote service or local model / 通过远程服务或本地模型编码查询。"""
     emb = _encode_query_remote(query)
     if emb is not None:
         return emb
@@ -141,7 +143,7 @@ def _encode_query(query: str) -> torch.Tensor:
 
 
 def _maxsim(query_emb: torch.Tensor, doc_emb: torch.Tensor) -> torch.Tensor:
-    """query_emb: [Tq, D]; doc_emb: [P, Td, D] -> scores: [P]."""
+    """Compute MaxSim scores: query_emb [Tq, D] x doc_emb [P, Td, D] -> scores [P] / 计算最大相似度分数。"""
     q = query_emb.float()
     d = doc_emb.float()
     sim = torch.einsum("td,pkd->ptk", q, d)
@@ -241,6 +243,7 @@ def colpali_retrieve(
     top_k: int = 5,
     doc_filter: Optional[list[str]] = None,
 ) -> list[PageHit]:
+    """Multi-vector retrieval returning top-k page hits / 多向量检索，返回 top-k 页面匹配结果。"""
     backend = CONFIG["retriever"].get("backend", "in_memory")
 
     if backend == "qdrant":

@@ -16,7 +16,6 @@ Previously tried:
 Return ONLY valid JSON:
 {{
   "is_sufficient": true | false,
-  "confidence": 0.0–1.0,
   "inconsistency": "",
   "missing_facts": [...]
 }}
@@ -25,4 +24,4 @@ Strict rules:
 - Every sub-task must have at least one fact with non-empty entity AND metric.
 - Numbers extracted from tables must preserve original precision.
 - If a page was retrieved but returned "not on this page", treat as reading_miss (not retrieval_miss).
-- Confidence ceiling is 0.85 unless all facts are from original document pages (not cached/computed).
+- Lean toward is_sufficient=false when any sub-task lacks structured fields — the standard variant is more lenient.

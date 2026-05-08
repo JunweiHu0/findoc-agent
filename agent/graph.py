@@ -1,11 +1,15 @@
-"""LangGraph state-machine assembly — 7-node topology for the FinDoc agent.
+"""LangGraph state-machine assembly — FinDoc agent topology.
 
-Nodes:
-    retrieval_scout -> planner -> executor -> verifier ->
-      sufficient -> synthesizer -> grounding -> END
-      not sufficient -> remediation -> executor (loop, max MAX_REFLEXION_ITER)
+Topology / 拓扑:
+    query_router → [needs_retrieval?]
+                   ├─ False → synthesizer (direct answer) → END
+                   └─ True  → retrieval_scout → planner → executor → plan_critic? →
+                              executor/verifier → (sufficient?) → synthesizer/remediation → executor
+                              → synthesizer → END
 
-The graph itself is stateless; AgentState flows through nodes as a TypedDict.
+Grounding node was removed (regex+if/else logic was brittle and added little value);
+citation extraction now happens inside synthesizer by parsing [doc_id p.N] from the
+generated answer. 删除了 grounding 节点，引用解析下放到 synthesizer。
 """
 
 from langgraph.graph import END, StateGraph
@@ -14,9 +18,9 @@ from loguru import logger
 from .config import MAX_REFLEXION_ITER
 from .llm import has_llm_key
 from .nodes.executor import executor_node
-from .nodes.grounding import grounding_node
 from .nodes.plan_critic import plan_critic_node, should_trigger_plan_critic
 from .nodes.planner import planner_node, retrieval_scout_node
+from .nodes.query_router import query_router_node
 from .nodes.remediation import remediation_node
 from .nodes.synthesizer import synthesizer_node
 from .nodes.verifier import verifier_node
@@ -34,16 +38,24 @@ def _route_after_verifier(state: AgentState) -> str:
 
 
 def _route_after_executor(state: AgentState) -> str:
-    """P29: Conditionally route to plan_critic if signal detected, otherwise verifier."""
+    """Conditionally route to plan_critic if signal detected, otherwise verifier.
+    检测到信号时路由到 plan_critic，否则到 verifier。"""
     if should_trigger_plan_critic(state):
         logger.info("plan_critic triggered — routing to plan review")
         return "plan_critic"
     return "verifier"
 
 
+def _route_after_query_router(state: AgentState) -> str:
+    """Skip retrieval pipeline entirely when the router says the query is directly answerable.
+    路由器判定可直答时，跳过整条检索流水线。"""
+    return "retrieval_scout" if state.get("needs_retrieval", True) else "synthesizer"
+
+
 def build_graph() -> StateGraph:
     """Construct the raw StateGraph with all nodes and edges (not yet compiled)."""
     g = StateGraph(AgentState)
+    g.add_node("query_router", query_router_node)
     g.add_node("retrieval_scout", retrieval_scout_node)
     g.add_node("planner", planner_node)
     g.add_node("executor", executor_node)
@@ -51,9 +63,13 @@ def build_graph() -> StateGraph:
     g.add_node("verifier", verifier_node)
     g.add_node("remediation", remediation_node)
     g.add_node("synthesizer", synthesizer_node)
-    g.add_node("grounding", grounding_node)
 
-    g.set_entry_point("retrieval_scout")
+    g.set_entry_point("query_router")
+    g.add_conditional_edges(
+        "query_router",
+        _route_after_query_router,
+        {"retrieval_scout": "retrieval_scout", "synthesizer": "synthesizer"},
+    )
     g.add_edge("retrieval_scout", "planner")
     g.add_edge("planner", "executor")
     g.add_conditional_edges(
@@ -68,8 +84,7 @@ def build_graph() -> StateGraph:
         {"remediation": "remediation", "synthesizer": "synthesizer"},
     )
     g.add_edge("remediation", "executor")
-    g.add_edge("synthesizer", "grounding")
-    g.add_edge("grounding", END)
+    g.add_edge("synthesizer", END)
     return g
 
 
@@ -103,6 +118,9 @@ if __name__ == "__main__":
         "todo_updates": [],
         "query_class": "",
         "agent_profile": {},
+        "plan_critic_last_cursor": -1,
+        "plan_critic_iter": 0,
+        "needs_retrieval": True,
     }
     out = app.invoke(init)
     print("\n=== Final state ===")

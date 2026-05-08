@@ -35,7 +35,7 @@ class HealthResponse(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P13: Conversations
+# Conversation history API models / 对话历史 API 模型
 # ---------------------------------------------------------------------------
 
 class ConversationCreate(BaseModel):
@@ -71,7 +71,7 @@ class ConversationDetail(BaseModel):
 
 
 # ---------------------------------------------------------------------------
-# P14: Upload
+# Upload and document API models / 上传和文档 API 模型
 # ---------------------------------------------------------------------------
 
 class UploadResponse(BaseModel):

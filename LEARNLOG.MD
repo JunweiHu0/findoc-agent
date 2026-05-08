@@ -844,3 +844,135 @@ findoc-agent/
 5. **向后兼容**：新字段 Optional、新路径 fallback 旧路径、旧 flat prompt 文件保留作 fallback。
 
 6. **零新依赖**：tenacity（langchain 间接依赖）、tiktoken（唯一新增）、ColQwen 128d embedding（复用已有模型）、YAML（标准库 pyyaml）。
+
+---
+
+## 十四、代码阅读指南
+
+按依赖关系从底层往上看，每一层只依赖它前面的层，没有循环依赖。
+
+### 第一阶段：数据结构与配置
+
+**1. `agent/state.py`** — 所有数据结构的定义
+
+`AgentState`（TypedDict，贯穿全部节点共享）、`SubTask`（规划结果）、`Fact`（抽取出的结构化事实）、`PageHit`（检索命中的页面）、`MissingFact`（verifier 诊断缺失的 schema）、`TodoItem`（运行时任务追踪）。先看完这个，后面每个节点读写什么字段就都清楚了。
+
+**2. `agent/config.py`** — 项目配置
+
+模型名称、top_k、index 路径、预算上限（`MAX_REFLEXION_ITER = 3`、`TOP_K = 5`）。代码很短，读完知道全局常量从哪来。
+
+**3. `agent/schemas.py`** — LLM 结构化输出的 pydantic 模型
+
+`PlannerOutput`（计划结构体）、`VerifierOutput`（充分性判断 + `MissingFact` 列表）、`ToolCall`。这些是 LLM 按 `json_mode` 强制输出的格式。理解了这个，后面看 planner/verifier 的 prompt 就知道 LLM 在往什么结构填空。
+
+### 第二阶段：基础设施
+
+**4. `agent/llm.py`** — LLM 工厂
+
+三个角色（planner/verifier/synthesizer）各自取 `ChatOpenAI` 实例，都走 DeepSeek API。没有抽象层，就是个按角色选模型的工厂函数，约 40 行。
+
+**5. `tools/registry.py`** — 工具注册中心
+
+定义了 `ToolSpec`（工具名 + 描述 + 入参出参 pydantic schema + 实际函数 + category）。四个内置工具：`retrieve_pages`（检索）、`read_page_with_vlm`（读图）、`calculate`（安全计算）、`disambiguate_caliber`（口径消歧）。planner 的 prompt 里注入 `get_tools_for_prompt()`，executor 用 `dispatch(name, args)` 调工具。看完这个再看 planner/executor 就知道 tool_calls 怎么被生成和执行。
+
+### 第三阶段：工具层
+
+**6. `tools/colpali_tool.py`** — 视觉检索核心
+
+ColQwen2 多向量编码查询 → 对每份已索引文档做 MaxSim → 返回全局 top-k 页面。支持 in-memory 和 Qdrant 两种后端，Qdrant 失败自动 fallback 到 in-memory。启动期 `preload()` 消冷启动。
+
+**7. `tools/vlm_tool.py`** — VLM 页面读取
+
+页面图 + instruction → OpenAI 兼容接口（默认 Qwen-VL）→ 提取文本。有缓存层（`vlm_cache.py`，同图同指令免调）。API key 为空时返回 mock 结果，保证骨架可运行。
+
+**8. `tools/fact_extractor.py`** — 结构化事实提取
+
+纯正则引擎。从 VLM 返回的自由文本中抽取 entity（公司名，20+ 已知实体 + 通用模式）、period（年份/季度/半年）、metric（毛利率/营收/ROE 等 17 种指标）、value（数值）、unit（亿元/% 等单位）。输出决定后续 fact_index 查重和 grounding 数值校验的质量。
+
+### 第四阶段：节点层（按执行顺序）
+
+**9. `agent/nodes/planner.py`** — 包含两个节点
+
+上半部分是 `retrieval_scout_node`：预检索全库，按 doc 聚合取每 doc 最佳页，返回 top-3 候选文档 + 相关性分数，让 planner 做 informed 决策而非盲规划。
+
+下半部分是 `planner_node`：三阶段——① 匹配技能（YAML 驱动，关键词命中则覆盖策略）→ ② 分类查询（启发式关键词 >95% 命中，其余走 LLM）→ ③ 加载变体 prompt + few-shot → 生成 DAG 执行计划（含 `depends_on` 依赖和 `tool_calls`）。
+
+**10. `agent/nodes/executor.py`** — DAG 并发调度
+
+构建任务依赖图（`task_id → depends_on`），同层无依赖任务 `ThreadPoolExecutor` 并发执行（最多 5 并发）。上游失败 → 下游自动标记 failed。tool_calls 优先走 registry dispatch，否则走默认检索+VLM 路径。跨轮缓存检索前检查（`_check_known_facts`，语义匹配硬命中跳过检索）。VLM 读完后立即 `fact_extractor` 结构化抽取。
+
+**11. `agent/nodes/plan_critic.py`** — 按需计划修订
+
+两个触发条件 OR：① VLM 读到的文本含 8 个财务披露信号词（口径变更/合并范围调整/追溯调整等）② 有任务执行失败。触发后调 LLM 评估剩余计划是否合理，输出 `{revise, new_subtasks, drop_task_ids}`。正常执行路径下完全透明——是一个按需插入的旁路。
+
+**12. `agent/nodes/verifier.py`** — 充分性判断
+
+两条路径：① 标准单实例（常规查询）② 3 实例并行多数表决（数值/对比查询，strict/base/numeric 三个 variant 同时跑，少数服从多数）。输出结构化 `MissingFact` 列表，每个含 `root_cause`（4 类：检索遗漏/阅读遗漏/查询歧义/跨页不一致）和修复建议。内部有早停逻辑：多轮无新事实时强制合成。
+
+**13. `agent/nodes/remediation.py`** — 差异化修复
+
+按 root_cause 分派 4 条修复路径，每条扣减对应的检索或 VLM 预算：
+
+| root_cause | 策略 | 扣减 |
+|---|---|---|
+| retrieval_miss | 放宽 top_k 重检索 | 检索 -1, VLM -1 |
+| reading_miss | 精炼指令重读同批页面 | VLM -1 |
+| ambiguous_query | 改写为自包含查询重检索 | 检索 -1, VLM -1 |
+| inconsistency | 触发口径消歧 | VLM -2 |
+
+预算耗尽时强制 `is_sufficient = True`，降级到 synthesis。
+
+**14. `agent/nodes/synthesizer.py`** — 答案生成
+
+汇总事实 → 带 `[doc_id p.N]` 引用生成最终答案。LLM 不可用时用 stub answer（原始证据拼接）。支持流式 token 输出：通过全局 `_token_hook` 回调注入，后端 server 将此 hook 指向 SSE 推送。
+
+**15. `agent/nodes/grounding.py`** — 后置审计
+
+纯规则，零 LLM 调用：
+- 逐条检查答案中 `[doc_id p.N]` 引用是否真的在 `extracted_facts` 里出现过
+- 逐条检查答案中的数值是否与证据中的数值模糊匹配（±0.1% 容差）
+- 未通过的直接从答案中剥离，插入置信度 banner
+- 校验结果回写数据库，用于记忆晋升判断
+
+### 第五阶段：组装与辅助
+
+**16. `agent/graph.py`** — 8 节点拓扑 + 三条条件边
+
+约 80 行。`build_graph()` 添加 8 个节点，`compile_graph()` 编译为可 stream/invoke 的 runnable。三条条件边的路由函数：
+- `_route_after_executor`：进 plan_critic 还是 verifier
+- `_route_after_verifier`：进 synthesizer 还是 remediation
+- `remediation → executor`（无条件的回流边）
+
+**17. `agent/memory.py`** — 三层语义记忆
+
+| 层 | 名称 | 机制 | 作用 |
+|---|---|---|---|
+| L1 | 工作记忆 | 同轮 `fact_index` dict 查找 | 同轮去重 |
+| L2 | 情景记忆 | conv_facts + 128d embedding + cosine | 硬命中(>0.85)跳过检索，软命中(0.5-0.85)作为先验 |
+| L3 | 语义记忆 | global_facts 跨对话 | promotion 条件：hit_count ≥ 3 且 grounding_verified = 1 |
+
+embedding 复用 ColQwen 文本编码器，零额外依赖。模型未加载时回退到字符 2-gram hash 稀疏向量。
+
+**18. `agent/compression.py`** — 上下文压缩
+
+- `compress_history`：聊天历史 >3 轮或 >800 token 时，旧轮次摘要为 `{实体, 指标, 意图, 文档}`，仅保留最近 2 轮 verbatim
+- `compress_evidence`：事实 >10 条时，按 `(entity, period, metric)` 去重，保留文本最长的一条
+- `TokenBudget`：每个节点有独立的 token 上限（planner 1200 / verifier 1500 / synthesizer 2000）
+
+**19. `backend/server.py`** — FastAPI 后端
+
+- `POST /api/v1/query`：SSE 流式推送节点进度 + token 实时输出 + todo 状态更新
+- 后台线程跑 LangGraph `stream()`，主线程 queue 轮询推 SSE — 解决 `astream` 在主线程的阻塞问题
+- 启动预加载模型 + 索引消冷启动
+- 对话持久化（SQLite）+ 跨轮事实复用 + 自动标题生成
+- 文档管理 API：列表/删除/重索引/封面缩略图
+- 文件上传 + 异步处理管道 + SSE 进度追踪
+
+### 阅读路线总结
+
+```
+state → config → schemas → llm
+  → tools/ (registry → colpali → vlm → fact_extractor)
+  → nodes/ (planner → executor → plan_critic → verifier → remediation → synthesizer → grounding)
+  → graph → memory → compression → backend/server
+```

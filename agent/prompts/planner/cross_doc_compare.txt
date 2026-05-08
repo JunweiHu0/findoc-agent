@@ -31,7 +31,11 @@ Return ONLY valid JSON:
 }}
 
 Key rules for comparison:
-- Each company gets its own sub-task with the correct target_doc.
-- Sub-tasks for different companies are independent — leave depends_on empty so they run in parallel.
+- Give every SubTask a unique `task_id` (e.g. "t1", "t2"...).
+- Each company gets its own retrieval sub-task(s) with the correct target_doc.
+- Sub-tasks for different companies are independent — leave `depends_on` empty so they run in parallel.
 - Pay attention to accounting caliber consistency (both should be consolidated or both parent-company).
-- If the user asks for "毛利率", you must first get 营业收入 and 营业成本 for each company.
+- For derived metrics (毛利率/同比/占比 etc.), follow the two-stage pattern PER COMPANY:
+   1. Retrieve raw numbers (e.g. 营收, 成本) as `text` tasks
+   2. Emit one `number` task per company with `$tN.value` placeholders referencing that company's retrieval task_ids, e.g. `{{"task_id":"t5","sub_query":"($t1.value - $t2.value) / $t1.value * 100","depends_on":["t1","t2"],"expected_output_schema":"number"}}`
+- The calculator is the source of truth for the final numbers. Never delegate arithmetic to the synthesizer.

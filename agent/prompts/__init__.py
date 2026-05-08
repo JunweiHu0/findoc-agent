@@ -1,4 +1,4 @@
-"""Prompt loader — reads .txt templates with variant + few-shot support (P30).
+"""Prompt loader with variant + few-shot support / Prompt 加载器——支持变体+few-shot。
 
 Structure:
     prompts/
@@ -23,13 +23,13 @@ _HERE = Path(__file__).resolve().parent
 
 
 def load_prompt(node: str, variant: str = "base", with_few_shot: bool = False) -> str:
-    """Load a prompt template for a given node and variant.
+    """Load a prompt template for a given node and variant / 加载指定节点和变体的提示模板。
 
-    Args:
+    Args / 参数:
         node: "planner" | "verifier" | "synthesizer" | "system"
         variant: "base" | "single_fact" | "cross_doc_compare" | "multi_step_calc"
                  | "trend_analysis" | "numeric" | "strict" | "factual"
-        with_few_shot: prepend few-shot examples (only for planner variants).
+        with_few_shot: prepend few-shot examples (only for planner variants) / 预置few-shot示例（仅用于planner变体）。
     """
     if node == "system":
         path = _HERE / "system" / "persona.txt"
@@ -62,9 +62,9 @@ def load_prompt(node: str, variant: str = "base", with_few_shot: bool = False) -
 
 
 def _load_few_shots(variant: str) -> str:
-    """Load few-shot examples matching a query_class variant from examples.jsonl.
+    """Load few-shot examples matching a query_class variant from examples.jsonl / 从examples.jsonl加载匹配query_class变体的few-shot示例。
 
-    Returns a formatted string of 2-3 examples, or empty string if not available.
+    Returns a formatted string of 2-3 examples, or empty string if not available / 返回2-3个格式化示例字符串，无可用示例时返回空字符串。
     """
     jsonl_path = _HERE / "planner" / "few_shot" / "examples.jsonl"
     if not jsonl_path.exists():
@@ -95,7 +95,7 @@ def _load_few_shots(variant: str) -> str:
 
 
 def list_variants(node: str) -> list[str]:
-    """List available variant names for a node."""
+    """List available variant names for a node / 列出某个节点的可用变体名称。"""
     dir_path = _HERE / node
     if not dir_path.is_dir():
         return ["base"]

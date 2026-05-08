@@ -1,7 +1,7 @@
-"""Planner node — decomposes user question into ordered sub-tasks.
+"""Planner node — two-stage query decomposition with skill matching / 规划节点——两段式查询分解+技能匹配。
 
-P22: retrieval_scout_node provides pre-retrieval context so the planner
-can make informed target_doc decisions instead of blind guessing.
+retrieval_scout_node provides pre-retrieval context so the planner can make
+informed target_doc decisions. 预检索探查为 planner 提供候选文档信息。
 """
 
 from __future__ import annotations
@@ -24,15 +24,12 @@ _PROMPT = load_prompt("planner")
 
 
 # ---------------------------------------------------------------------------
-# P22: Retrieval Scout — pre-retrieval to inform planner
+# Retrieval Scout — pre-retrieval to inform planner / 检索前探查
 # ---------------------------------------------------------------------------
 
 def retrieval_scout_node(state: AgentState) -> dict:
     """Lightweight pre-retrieval: run query against all docs, return top-3 candidate docs.
-
-    The planner consumes scout_candidates to set target_doc intelligently,
-    fixing the "blind planner" problem where it could only guess from doc_id strings.
-    """
+    轻量预检索：查询全库返回 top-3 候选文档。Planner 据此做 informed target_doc 决策。"""
     query = state.get("query", "")
     if not query:
         return {"scout_candidates": []}
@@ -92,7 +89,7 @@ def _load_doc_metadata() -> str:
 
 
 def _render_candidate_docs(state: AgentState) -> str:
-    """P22: Render scout_candidates as richer doc metadata for the planner prompt."""
+    """Render scout_candidates as rich doc metadata for the planner prompt / 渲染候选文档元数据。"""
     candidates = state.get("scout_candidates") or []
     if not candidates:
         # Fall back to basic doc_metadata
@@ -121,16 +118,14 @@ def _render_candidate_docs(state: AgentState) -> str:
 
 
 def planner_node(state: AgentState) -> dict:
-    """P30+P32 two-stage: match skill → classify query → load variant prompt → generate plan.
+    """Two-stage planner: match skill → classify → variant prompt → generate plan.
+    两段式规划：匹配技能→分类查询→变体 prompt+few-shot→生成计划。
 
-    Stage 0 (P32): Check skill registry for a matching skill. If found, use its
-                   plan_template and strategy overrides.
-    Stage 1 (P30): Lightweight classification (~200 tokens) to determine query_class.
-    Stage 2 (P30): Load variant-specific prompt + few-shot examples, generate full plan.
-
-    Falls back to a single-SubTask plan when LLM key is missing or call fails.
-    P27: uses compress_history instead of raw _render_history.
-    """
+    Stage 0: Check skill registry, override plan_template + strategy if matched.
+    Stage 1: Lightweight classification (~200 tokens) → query_class.
+    Stage 2: Load variant prompt + few-shot → generate full plan.
+    Falls back to single-SubTask when LLM unavailable. Uses compress_history.
+    Stage 0 匹配技能；Stage 1 轻量分类；Stage 2 变体 prompt 生成；LLM 不可用时回退。"""
     if not has_llm_key():
         logger.warning("DEEPSEEK_API_KEY not set — planner falls back to single sub-task")
         return _fallback(state)
@@ -140,7 +135,7 @@ def planner_node(state: AgentState) -> dict:
     compressed_ctx = compress_history(history) if history else "(no prior turns)"
     doc_metadata = _render_candidate_docs(state)
 
-    # P32 Stage 0: match skill
+    # Stage 0: match skill / 匹配技能
     skill = None
     skill_strategy = {}
     try:
@@ -152,8 +147,7 @@ def planner_node(state: AgentState) -> dict:
     except ImportError:
         pass
 
-    # Stage 1: classify query type (lightweight, ~200 tokens).
-    # If skill matched, use its plan_template as the query_class directly.
+    # Stage 1: classify query / 分类查询
     query_class = state.get("query_class") or ""
     if not query_class:
         if skill and skill.plan_template != "base":
@@ -161,7 +155,7 @@ def planner_node(state: AgentState) -> dict:
         else:
             query_class = _classify_query(query, compressed_ctx)
 
-    # Stage 2: load variant-specific prompt with few-shot
+    # Stage 2: load variant prompt with few-shot / 加载变体 prompt + few-shot
     try:
         variant_prompt = load_prompt("planner", variant=query_class or "base", with_few_shot=True)
     except Exception:
@@ -185,7 +179,7 @@ def planner_node(state: AgentState) -> dict:
             "plan_cursor": 0,
             "query_class": result.query_class or query_class,
         }
-        # Pass skill strategy to executor via remediation_hint (compatible field)
+        # Pass skill strategy to executor / 传递技能策略到 executor
         if skill_strategy:
             delta["remediation_hint"] = skill_strategy
         return delta
@@ -199,12 +193,12 @@ def planner_node(state: AgentState) -> dict:
 
 
 def _classify_query(query: str, chat_context: str = "") -> str:
-    """Stage 1: Lightweight query classification (~200 token LLM call).
+    """Lightweight query classification (~200 token LLM), heuristic-first / 轻量查询分类，启发式优先。
 
-    Returns one of: single_fact, cross_doc_compare, multi_step_calc, trend_analysis.
-    Falls back to 'single_fact' on any error.
-    """
-    # Quick heuristic: check for keywords to avoid unnecessary LLM calls
+    Returns: single_fact | cross_doc_compare | multi_step_calc | trend_analysis.
+    Keyword heuristic catches >95% of queries; LLM fallback for ambiguous cases.
+    关键词启发式覆盖 >95% 查询，剩余走 LLM。"""
+    # Heuristic: keyword matching first / 启发式：先关键词
     if any(kw in query for kw in ["对比", "比较", "vs", "versus", "差异", "哪个"]):
         return "cross_doc_compare"
     if any(kw in query for kw in ["趋势", "变化", "增长", "逐年", "历年"]):
@@ -239,5 +233,5 @@ def _classify_query(query: str, chat_context: str = "") -> str:
 
 
 def _fallback(state: AgentState) -> dict:
-    """Return a single-SubTask plan using the raw user query."""
+    """Return a single-SubTask plan using the raw user query / 用原始查询生成单步回退计划。"""
     return {"plan": [SubTask(sub_query=state["query"])], "plan_cursor": 0}

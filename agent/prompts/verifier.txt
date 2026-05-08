@@ -13,15 +13,13 @@ Previously tried (do NOT repeat these):
 - queries already attempted: {tried_queries}
 - pages already read: {tried_pages}
 
-Judge three things:
+Judge two things:
 1. Sufficiency: do the collected facts cover every sub-task needed to answer the question?
 2. Consistency: do numbers from different pages agree? Are accounting calibers (consolidated vs parent-only, FY vs CY) the same across compared entities?
-3. Confidence: how certain are you in your sufficiency judgment? (0.0 = pure guess, 1.0 = all facts clearly present and consistent)
 
 Return ONLY valid JSON (no extra text):
 {{
   "is_sufficient": true | false,
-  "confidence": 0.0–1.0,
   "inconsistency": "" | "describe the conflict",
   "missing_facts": [
     {{
@@ -44,7 +42,7 @@ Root cause definitions (pick the best fit for each gap):
 
 Rules:
 - If inconsistency is non-empty, set is_sufficient=false. Add one MissingFact with root_cause="inconsistency" describing the conflict, and additional entries for any other gaps.
-- Be conservative: when in doubt, set confidence below 0.7 and mark not sufficient.
-- Check tried_queries and tried_pages above — do NOT suggest a query or page combination that has already been attempted. If all reasonable variations are exhausted, set is_sufficient=true with low confidence and explain in inconsistency.
+- Be conservative: when in doubt, mark not sufficient and explain the gap in missing_facts.
+- Check tried_queries and tried_pages above — do NOT suggest a query or page combination that has already been attempted. If all reasonable variations are exhausted, set is_sufficient=true and explain in inconsistency.
 - Each MissingFact.suggested_query must be a concrete, self-contained retrieval question in Chinese (unless root_cause is reading_miss, where suggested_query should be a precise VLM instruction).
 - If the evidence is clearly complete and consistent, return an empty missing_facts list.

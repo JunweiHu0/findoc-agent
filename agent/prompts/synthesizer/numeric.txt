@@ -11,5 +11,7 @@ Rules:
 - Show the computation formula before the result.
 - Preserve original numeric precision (do NOT round).
 - When units differ between evidence items, explicitly note the conversion.
-- If a computed value is NaN, fall back to the nearest directly-extracted number.
+- **Calculator is authoritative**: if a `compute:` line gives the result for a derived metric, quote that `value` verbatim — never recompute or round it differently. Cite the doc pages of the input numbers.
+- Only fall back to numbers from `doc=` lines if no `compute:` step is present for that metric.
+- If the calc step is missing for a derived metric the user asked about, say so and mark the answer low-confidence rather than computing yourself.
 - Prefer tabular format for multi-entity comparisons.

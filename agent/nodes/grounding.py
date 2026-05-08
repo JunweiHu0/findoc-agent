@@ -1,4 +1,4 @@
-"""Grounding node (P23) — post-hoc citation + numeric audit.
+"""Grounding node — post-hoc citation and numeric audit with feedback writeback / 后置校验节点——引用+数值审计，含验证结果回写。
 
 Runs after synthesizer and before END. Validates:
 1. Every `[doc_id p.N]` citation in the answer corresponds to an actual
@@ -31,7 +31,7 @@ _TOLERANCE = 0.001
 
 
 def grounding_node(state: AgentState) -> dict:
-    """Run citation + numeric audit on the final answer. Strip unverified claims."""
+    """Run citation + numeric audit on the final answer. Strip unverified claims and insert confidence banner. / 对最终答案运行引用+数值审计，剥离未验证声明并插入置信度标识。"""
     answer = state.get("answer") or ""
     if not answer:
         return {"grounding_score": 1.0, "unverified_claims": []}
@@ -91,7 +91,7 @@ def grounding_node(state: AgentState) -> dict:
     clean_answer = _strip_unverified_citations(answer, unverified)
     clean_answer = _add_grounding_banner(clean_answer, grounding_score, unverified)
 
-    # P28: Feedback writeback — mark matched facts as verified
+    # feedback writeback — mark matched facts as verified / 反馈写回——标记匹配的事实为已验证
     _writeback_verification(state, unverified)
 
     logger.info(
@@ -108,12 +108,7 @@ def grounding_node(state: AgentState) -> dict:
 
 
 def _writeback_verification(state: AgentState, unverified: list[dict]) -> None:
-    """P28: Write grounding verification results back to conv_facts.
-
-    Facts whose citations appear in the answer and pass numeric checks are
-    marked grounding_verified=1. Facts with unverified citations/numbers
-    are marked tainted=1. Also checks for promotion to global_facts (L3).
-    """
+    """Write grounding verification results back to conv_facts for memory promotion / 将校验结果写回 conv_facts 用于记忆晋升。"""
     try:
         from backend.storage import mark_conv_fact_verified, load_conv_facts, upsert_global_fact
         from agent.config import CONFIG
@@ -163,7 +158,7 @@ def _writeback_verification(state: AgentState, unverified: list[dict]) -> None:
 
 
 def _fuzzy_match(value: float, known: list[tuple[float, str]]) -> Optional[tuple[float, str]]:
-    """Check if a numeric value is within tolerance of any known fact number."""
+    """Check if a numeric value matches any known fact within tolerance / 检查数值是否在容差内匹配已知事实。"""
     if value == 0:
         return (0.0, "") if any(abs(kv[0]) < 1e-9 for kv in known) else None
     for kv, text in known:
@@ -179,7 +174,7 @@ def _fuzzy_match(value: float, known: list[tuple[float, str]]) -> Optional[tuple
 
 
 def _strip_unverified_citations(answer: str, unverified: list[dict]) -> str:
-    """Remove citations that failed verification from the answer text."""
+    """Remove citations that failed verification from the answer / 从答案中移除未通过校验的引用。"""
     bad_cites = {
         u["text"] for u in unverified
         if u.get("reason") == "citation_not_in_evidence"
@@ -194,7 +189,7 @@ def _strip_unverified_citations(answer: str, unverified: list[dict]) -> str:
 
 
 def _add_grounding_banner(answer: str, score: float, unverified: list[dict]) -> str:
-    """Prepend a confidence banner when grounding checks reveal issues."""
+    """Prepend a confidence banner when grounding checks reveal issues / 校验发现问题时前置置信度标识。"""
     unverified_ratio = len(unverified) / max(len(_CITATION_RE.findall(answer)) + len(list(_NUMERIC_RE.finditer(answer))), 1)
 
     if score >= 0.95 and not unverified:

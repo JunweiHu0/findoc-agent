@@ -72,11 +72,10 @@ def _summarize_node(node: str, delta: dict[str, Any]) -> str:
         err_str = f" {errors}错误" if errors else ""
         return f"检索{pages}页 抽取{facts}事实 计算{cvs}{err_str}"
     if node == "verifier":
-        confidence = delta.get("confidence", 0.5)
         if delta.get("is_sufficient"):
-            return f"充分 (置信{confidence:.0%})"
+            return "充分"
         missing = len(delta.get("missing_facts") or [])
-        return f"缺{missing}项 (置信{confidence:.0%})"
+        return f"缺{missing}项"
     if node == "plan_critic":
         todo_updates = delta.get("todo_updates") or []
         dropped = sum(1 for t in todo_updates if t.get("status") == "skipped")
@@ -95,14 +94,8 @@ def _summarize_node(node: str, delta: dict[str, Any]) -> str:
         ans = delta.get("answer") or ""
         cites = len(delta.get("citations") or [])
         return f"生成答案({len(ans)}字符 {cites}引用)"
-    if node == "grounding":
-        score = delta.get("grounding_score", 1.0)
-        unverified = len(delta.get("unverified_claims") or [])
-        if score >= 0.95:
-            return f"校验通过 ({score:.0%})"
-        elif score >= 0.7:
-            return f"{unverified}项未匹配 ({score:.0%})"
-        return f"{unverified}项严重 ({score:.0%})"
+    if node == "query_router":
+        return "需要检索" if delta.get("needs_retrieval", True) else "直接回答(无需检索)"
     return ""
 
 
@@ -162,8 +155,7 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
 
     if node == "verifier":
         suff = "✅ 信息充分" if delta.get("is_sufficient") else "❌ 信息不充分"
-        conf = delta.get("confidence", 0.5)
-        out = f"**判断**: {suff}  (置信度 {conf:.0%})"
+        out = f"**判断**: {suff}"
         missing = delta.get("missing_facts") or []
         if missing:
             out += f"\n\n**缺失项** ({len(missing)}):"
@@ -216,15 +208,11 @@ def _format_delta(node: str, delta: dict[str, Any]) -> str:
             )
         return out
 
-    if node == "grounding":
-        score = delta.get("grounding_score", 1.0)
-        unverified = delta.get("unverified_claims") or []
-        if not unverified:
-            return f"✅ 全部校验通过 ({score:.0%})"
-        lines = [f"**校验结果** — {len(unverified)} 项未匹配 (得分 {score:.0%})\n"]
-        for u in unverified[:5]:
-            lines.append(f"- `{u.get('text','?')}` — {u.get('reason','?')}")
-        return "\n".join(lines)
+    if node == "query_router":
+        needs = delta.get("needs_retrieval", True)
+        if needs:
+            return "**路由判断**: 需要查阅文档 — 进入检索流水线"
+        return "**路由判断**: 可直接回答 — 跳过检索，直奔合成"
 
     return ""
 
@@ -254,8 +242,6 @@ def _initial_state(
         "budget_retrievals": 10,
         "budget_vlm_calls": 20,
         "scout_candidates": [],
-        "unverified_claims": [],
-        "grounding_score": 0.0,
         "fact_index": {},
         "known_facts": known_facts or [],
         "error_log": [],
@@ -263,15 +249,18 @@ def _initial_state(
         "todo_updates": [],
         "query_class": "",
         "agent_profile": {},
+        "plan_critic_last_cursor": -1,
+        "plan_critic_iter": 0,
+        "needs_retrieval": True,
     }
 
 
-# P15: how many recent (user, assistant) pairs to inject into planner context
+# How many recent (user, assistant) pairs to inject into planner context
 _HISTORY_TURNS = 4
 
 
 async def _maybe_auto_title(conv_id: str, query: str, answer: str) -> None:
-    """P17: After the first user turn finishes, ask the LLM for a short title.
+    """Auto-generate conversation title after first turn / 首轮完成后自动生成对话标题。
 
     Fire-and-forget: any failure is swallowed — the conversation just keeps
     its 26-char query stub. Only triggered when the conversation has exactly
@@ -391,8 +380,8 @@ async def query(req: QueryRequest):
 
     node_queue: queue.Queue[tuple[str, dict]] = queue.Queue()
     progress_queue: queue.Queue[str] = queue.Queue()
-    token_queue: queue.Queue[str] = queue.Queue()  # P16: synthesizer streaming
-    todo_queue: queue.Queue[dict] = queue.Queue()  # P26.5: todo status updates
+    token_queue: queue.Queue[str] = queue.Queue()  # synthesizer streaming / 合成器流式输出
+    todo_queue: queue.Queue[dict] = queue.Queue()  # todo status updates
 
     def _on_progress(msg: str) -> None:
         progress_queue.put(msg)
@@ -426,7 +415,7 @@ async def query(req: QueryRequest):
 
     async def event_stream():
         history = _load_chat_history(conv_id)
-        # P25: load cross-turn facts
+        # load cross-turn facts / 加载跨轮事实
         known_facts = storage.load_conv_facts(conv_id) if conv_id else []
         state = _initial_state(req.query, req.doc_filter, history, known_facts)
         thread = threading.Thread(target=_run_agent_sync, args=(state,), daemon=True)
@@ -444,7 +433,7 @@ async def query(req: QueryRequest):
                 except queue.Empty:
                     break
 
-            # Drain synthesizer tokens (P16) — emitted while synthesizer node is still running.
+            # Drain synthesizer tokens (synthesizer streaming) — emitted while synthesizer node is still running.
             had_token = False
             while True:
                 try:
@@ -455,11 +444,13 @@ async def query(req: QueryRequest):
                 except queue.Empty:
                     break
 
-            # Drain todo_updates (P26.5) from state delta
+            # drain todo_updates
             while True:
                 try:
                     todo_update = todo_queue.get_nowait()
-                    payload = json.dumps(todo_update, ensure_ascii=False)
+                    # ensure the payload carries a discriminator the frontend can match
+                    # 给前端的 SSE 解析加上判别字段
+                    payload = json.dumps({"type": "todo", **todo_update}, ensure_ascii=False)
                     yield f"event: todo\ndata: {payload}\n\n"
                 except queue.Empty:
                     break
@@ -486,7 +477,7 @@ async def query(req: QueryRequest):
                 thread.join()
                 return
 
-            # P26.5: push todo_updates from this node's delta to the todo queue
+            # push todo_updates from this node's delta / 从节点增量推送状态更新
             for tu in data.get("todo_updates") or []:
                 todo_queue.put(tu)
 
@@ -494,6 +485,7 @@ async def query(req: QueryRequest):
             summary = _summarize_node(node_name, data)
             content = _format_delta(node_name, data)
             payload = json.dumps({
+                "type": "node",
                 "node": node_name, "summary": summary, "content": content,
             }, ensure_ascii=False)
             yield f"event: node\ndata: {payload}\n\n"
@@ -513,9 +505,19 @@ async def query(req: QueryRequest):
         accumulated: dict[str, Any] = data  # data from __done__
         answer = (accumulated.get("answer") or "").strip()
         citations = accumulated.get("citations") or []
-        pages = accumulated.get("retrieved_pages") or []
-        grounding_score = accumulated.get("grounding_score", 1.0)
-        unverified_claims = accumulated.get("unverified_claims") or []
+        all_pages = accumulated.get("retrieved_pages") or []
+
+        # Filter retrieved_pages down to ones the model actually cited.
+        # Citations come from synthesizer parsing [doc_id p.N] from the answer text,
+        # so this gives "the page(s) the model used", not "every page we retrieved".
+        # 把"检索到的所有页"过滤为"模型答案里真正引用的页"
+        cited_keys: set[tuple[str, int]] = {
+            (c.doc_id, c.page_num) for c in citations
+        }
+        pages = [
+            p for p in all_pages
+            if (p.doc_id, p.page_num) in cited_keys
+        ]
 
         # Persist to conversation history
         try:
@@ -528,7 +530,7 @@ async def query(req: QueryRequest):
         except Exception as e:
             logger.warning(f"Failed to persist messages for conv {conv_id}: {e}")
 
-        # P25: persist structured facts for cross-turn reuse
+        # persist structured facts for cross-turn reuse / 持久化结构化事实
         try:
             extracted = accumulated.get("extracted_facts") or []
             fact_dicts = [f.model_dump() if hasattr(f, "model_dump") else f for f in extracted]
@@ -536,7 +538,7 @@ async def query(req: QueryRequest):
         except Exception as e:
             logger.warning(f"Failed to save conv_facts for {conv_id}: {e}")
 
-        # P17: fire-and-forget auto-title once we have a (user, assistant) pair.
+        # fire-and-forget auto-title / 异步自动标题
         asyncio.create_task(_maybe_auto_title(conv_id, req.query, answer))
 
         done = json.dumps({
@@ -545,8 +547,6 @@ async def query(req: QueryRequest):
             "answer": answer,
             "citations": [_citation_to_out(c).model_dump() for c in citations],
             "retrieved_pages": [_page_hit_to_out(p).model_dump() for p in pages],
-            "grounding_score": grounding_score,
-            "unverified_claims": unverified_claims,
         }, ensure_ascii=False)
         yield f"event: done\ndata: {done}\n\n"
 
@@ -586,7 +586,7 @@ async def health():
 
 
 # ---------------------------------------------------------------------------
-# P13: Conversation endpoints
+# Conversation endpoints
 # ---------------------------------------------------------------------------
 
 @app.get("/api/v1/conversations", response_model=list[ConversationOut])
@@ -629,7 +629,7 @@ async def delete_conversation_endpoint(conv_id: str):
 
 
 # ---------------------------------------------------------------------------
-# P14: Document / Upload endpoints (stubs — pipeline in ingestion/upload.py)
+# Document / Upload endpoints (stubs — pipeline in ingestion/upload.py)
 # ---------------------------------------------------------------------------
 
 _PAGE_IMG_EXTS = {".png", ".jpg", ".jpeg", ".webp"}
@@ -774,7 +774,7 @@ async def delete_doc(doc_id: str):
 
 
 # ---------------------------------------------------------------------------
-# P18: Reindex + cover preview
+# Reindex + cover preview
 # ---------------------------------------------------------------------------
 
 @app.post("/api/v1/documents/{doc_id}/reindex", response_model=UploadResponse)
@@ -866,7 +866,7 @@ async def doc_cover(doc_id: str):
 
 
 # ---------------------------------------------------------------------------
-# P14: Upload endpoint
+# Upload endpoint
 # ---------------------------------------------------------------------------
 
 # In-memory upload progress tracking: upload_id → {doc_id, status, message, pct, finished_at}

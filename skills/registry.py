@@ -1,4 +1,4 @@
-"""Skill Registry (P32) — named bundles of prompt + tools + strategy.
+"""Skill Registry — named bundles of prompt + tools + strategy.
 
 A skill is a configuration-driven packaging of a prompt variant, tool list,
 strategy defaults, and output schema. Skills are matched by trigger keywords
@@ -29,7 +29,7 @@ class SkillSpec:
     description: str = ""              # human-readable
     triggers: list[str] = field(default_factory=list)  # keyword triggers
     trigger_patterns: list[re.Pattern] = field(default_factory=list)  # compiled regex
-    plan_template: str = "base"        # prompt variant name (maps to P30)
+    plan_template: str = "base"        # prompt variant name
     tools: list[str] = field(default_factory=list)
     strategy: dict = field(default_factory=dict)
     verifier: str = "base"             # verifier variant
@@ -111,7 +111,7 @@ def match_skill(query: str) -> Optional[SkillSpec]:
         logger.info(f"skill match: {best.name} (keyword score={best_score})")
         return best
 
-    # Phase 2: semantic fallback (deferred to P28 memory system — for now, return None)
+    # Phase 2: semantic fallback (deferred to memory system — for now, return None)
     if best_score == 0:
         logger.debug("skill match: no keyword hit, using default planner")
         return None

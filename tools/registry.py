@@ -1,4 +1,4 @@
-"""Tool Registry (P21) — typed, self-describing tool dispatch.
+"""Tool Registry — typed, self-describing tool dispatch / 工具注册中心——类型化自描述工具分发。
 
 Each tool registers a ToolSpec: name, human description (for the planner),
 typed params_schema / output_schema (both pydantic), and a callable.
@@ -89,12 +89,13 @@ def _type_name(annotation) -> str:
 
 
 def register(spec: ToolSpec) -> None:
+    """Register a tool specification in the global registry / 在全局注册中心注册工具规格。"""
     REGISTRY[spec.name] = spec
     logger.debug(f"registered tool: {spec.name} ({spec.category})")
 
 
 def get_tools_for_prompt() -> str:
-    """Format the registry as a planner-prompt section."""
+    """Format the registry as a planner-prompt section / 将注册中心格式化为规划器提示段落。"""
     if not REGISTRY:
         return "(no tools registered)"
     lines: list[str] = []
@@ -107,7 +108,7 @@ def get_tools_for_prompt() -> str:
 
 
 def dispatch(tool_name: str, args: dict) -> Any:
-    """Invoke a tool by name; validate output against output_schema."""
+    """Invoke a tool by name; validate output against output_schema / 按名称调用工具；根据输出模式验证输出结果。"""
     spec = REGISTRY.get(tool_name)
     if spec is None:
         raise KeyError(f"Unknown tool: {tool_name}. Available: {list(REGISTRY.keys())}")
