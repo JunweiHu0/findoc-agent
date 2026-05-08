@@ -1,6 +1,6 @@
 # FinDoc Agent
 
-> Multimodal RAG agent for visually dense financial documents — annual reports, prospectuses, and research notes. Built on **ColQwen2** visual retrieval + **LangGraph** 7-node state machine with structured reflexion, grounding audit, and cross-turn memory.
+> Multimodal RAG agent for visually dense financial documents — annual reports, prospectuses, and research notes. Built on **ColQwen2** visual retrieval + **LangGraph** 8-node state machine with structured reflexion, LLMCompiler-style DAG execution, and cross-turn memory.
 
 [![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-1c3c3c)](https://langchain-ai.github.io/langgraph/)
@@ -41,81 +41,101 @@ Financial annual reports present two fundamental challenges that break tradition
 **Use a vision-language retriever to bypass OCR entirely, and an agent state machine to orchestrate multi-step reasoning.**
 
 - **ColQwen2** directly indexes *page images* with multi-vector embeddings + MaxSim late interaction, preserving table structure, chart layouts, and number formatting that OCR would corrupt.
-- The **Agent** layer handles task decomposition, tool orchestration, root-cause diagnosis, differentiated remediation, and post-hoc citation/numeric auditing — transforming "retrieved pages" into "structured, cited, and verified answers."
+- The **Agent** layer handles query routing, task decomposition into DAG plans, LLMCompiler-style cross-task data flow, tool orchestration, root-cause diagnosis, differentiated remediation, and citation/numeric auditing — transforming "retrieved pages" into "structured, cited, and verified answers."
 
-### Capabilities (as of P25)
+### Capabilities
 
 | Capability | Description |
 |---|---|
+| **Query routing** | Keyword heuristics + lightweight LLM decides whether to engage retrieval or answer directly |
 | **Multi-document QA** | Query across 14+ indexed annual reports with automatic doc routing |
 | **Comparative analysis** | Cross-company metric comparison with caliber disambiguation |
-| **Numeric computation** | AST-safe expression evaluation (e.g., `(1505.6 + 1420.3) / 2`) |
+| **Numeric computation** | AST-safe expression evaluation with `$task_id.value` cross-task data flow (LLMCompiler-style) |
 | **Structured reflexion** | Root-cause-aware verification: `retrieval_miss` / `reading_miss` / `ambiguous_query` / `inconsistency` |
-| **Grounding audit** | Post-hoc citation verification + numeric fuzzy match (±0.1%); unverified claims stripped with confidence banner |
-| **Cross-turn memory** | Structured fact store (entity, period, metric, value) persists across conversation turns; follow-up questions skip retrieval |
+| **Citation verification** | Regex-based citation parsing from answer text; unverified `[doc p.N]` references stripped |
+| **Cross-turn memory** | Three-layer architecture: Working dict → Episodic SQLite → Semantic global; cosine ≥ 0.85 hits skip retrieval |
 | **Streaming output** | Token-by-token SSE streaming from synthesizer |
 | **User document upload** | Upload PDFs/images → auto-encode → Qdrant index → immediately queryable |
 | **Knowledge base management** | Panel UI for list / delete / reindex / cover preview |
+| **Error recovery** | Tenacity exponential backoff, transient/fatal distinction, structured `error_log` |
 
 ---
 
 ## 2. Architecture
 
-### 2.1 Agent Workflow (7-Node State Machine)
+### 2.1 Agent Workflow (8-Node State Machine)
 
 ```
 User Query
     │
     ▼
-┌──────────────────┐  Pre-retrieval: MaxSim across all docs → top-3 candidates
-│ retrieval_scout  │  (P22)
+┌──────────────────┐  Keyword heuristic + LLM fallback (~80 tokens)
+│  query_router    │  Decides: needs document retrieval?
 └────────┬─────────┘
          │
-         ▼
-┌──────────┐         Decomposes query → ordered SubTask list
-│ Planner  │  ──►    Each SubTask: sub_query / target_doc / tool_calls / query_class
-└──────────┘         Input includes candidate_docs + Available Tools registry
-    │
-    ▼
-┌──────────┐         tool_calls → registry dispatch (P21)
-│ Executor │  ──►    Fallback: expected_output_schema routing
-└──────────┘         VLM output → fact_extractor structuring (P24)
-    │                Pre-retrieval: check known_facts cache (P25)
-    ▼
-┌──────────┐         Structured missing_facts with root_cause + confidence
-│ Verifier │  ──►    Early-stop: no new facts → force synthesizer
-└──────────┘
-    │
-    ├─ sufficient ──────────────────┐
-    │                                ▼
-    ├─ not sufficient ─► ┌──────────┐  Per root_cause dispatch (P20):
-    │                    │Remediation│  retrieval_miss → widen top_k, re-retrieve
-    │                    └─────┬─────┘  reading_miss → refine instruction, re-read
-    │                          │        ambiguous_query → rewrite self-contained
-    │                          ▼        inconsistency → disambiguate_caliber
-    │                      Executor     budget exhausted → fallthrough
-    │                          │
-    └──────────────────────────┘
-                               ▼
-                        ┌─────────────┐
-                        │ Synthesizer │  Aggregate facts → cited answer (streaming)
-                        └──────┬──────┘
-                               ▼
-                        ┌─────────────┐  Citation reverse-lookup + numeric fuzzy match
-                        │  Grounding  │  Strip unverified claims + confidence banner
-                        └─────────────┘
+   ┌─────┴─────┐
+   │ needs     │
+   │ retrieval?│
+   └─────┬─────┘
+   False │       True
+         ▼         ▼
+┌─────────────┐  ┌──────────────────┐  MaxSim across all docs → top-3 candidates
+│ synthesizer │  │ retrieval_scout  │  (informs planner with candidate docs)
+│  (direct)   │  └────────┬─────────┘
+└──────┬──────┘           │
+       │                  ▼
+       │         ┌──────────┐         query_class localization → variant prompt
+       │         │ planner  │  ──►    + few-shot → ordered DAG plan with task_ids
+       │         └────┬─────┘         and `$tN.value` cross-task placeholders
+       │              │
+       │              ▼
+       │         ┌──────────┐         DAG topological sort → ThreadPool concurrent
+       │         │ executor │  ──►    layers; `$tN.value` resolution → calculator;
+       │         └────┬─────┘         Tool Registry dispatch; VLM read + fact_extractor
+       │              │
+       │              ▼
+       │    ┌────────────────────┐
+       │    │ should trigger     │  Signal words or failed todos → plan_critic
+       │    │ plan_critic?       │  revises plan (re-entry guard: cursor + iter cap)
+       │    └──┬──────────┬──────┘
+       │    No │          │ Yes
+       │       ▼          ▼
+       │  ┌──────────┐  ┌─────────────┐  Revises plan → loops back to executor
+       │  │ verifier │  │ plan_critic │  (max 2 revisions per plan)
+       │  └────┬─────┘  └──────┬──────┘
+       │       │                │
+       │       │                └──→ executor
+       │       ├─ sufficient ──────────────────┐
+       │       │                                ▼
+       │       ├─ insufficient ─► ┌──────────┐  Root-cause dispatch → explicit tool_calls
+       │       │                 │remediation│  (read_page_with_vlm / disambiguate_caliber)
+       │       │                 └─────┬─────┘  Budget accounting; exhausted → fallthrough
+       │       │                       │
+       │       │                       ▼
+       │       └─────────────────→ executor
+       │                               │
+       └───────────────────────────────┘
+                                       ▼
+                              ┌─────────────┐
+                              │ synthesizer │  Aggregate facts → cited answer (SSE streaming)
+                              └──────┬──────┘  Regex-parse `[doc p.N]` from output;
+                                     │         strip fabricated citations against evidence
+                                     ▼
+                                     END
 ```
+
+**8 nodes:** 7 permanent (query_router, retrieval_scout, planner, executor, verifier, remediation, synthesizer) + 1 on-demand (plan_critic).
 
 ### 2.2 Deployment Topology
 
 ```
 ┌─ uvicorn backend.server:app (port 8001) ──────┐
 │  FastAPI + SSE                                  │
-│  POST /api/v1/query     → SSE stream (7 nodes) │
+│  POST /api/v1/query     → SSE stream (8 nodes) │
 │  GET  /api/v1/documents → indexed doc list      │
 │  GET  /api/v1/health                            │
 │  startup → preload ColQwen2 + indexes           │
-│  per-query → load/save conv_facts (P25)         │
+│  per-query → load/save conv_facts               │
 └──────────────────┬──────────────────────────────┘
                    │
         ┌──────────┴────────────┐
@@ -129,8 +149,8 @@ User Query
 
 ┌─ chainlit run app/chainlit_app.py ────────────┐
 │  Pure UI (only imports chainlit / httpx)       │
-│  Consumes SSE: event=node|status|token|done    │
-│  Dynamic Step + inline Images + conf banner    │
+│  Consumes SSE: event=status|token|node|todo    │
+│  Dynamic Step + inline Images + TodoList       │
 └────────────────────────────────────────────────┘
 ```
 
@@ -138,15 +158,16 @@ User Query
 
 ### 2.3 Node Responsibilities
 
-| Node | Role | Added |
-|---|---|---|
-| `retrieval_scout` | Pre-retrieves top-3 candidate docs with relevance scores; gives planner informed context | P22 |
-| `planner` | Decomposes `question → [SubTask...]` with `tool_calls` / `target_doc` / `query_class` | P1 |
-| `executor` | Dispatches SubTasks via Tool Registry or legacy schema routing; runs VLM reads concurrently | P1 + P21 |
-| `verifier` | Structured sufficiency + consistency judgment → `MissingFact[]` with root cause | P1 + P19 |
-| `remediation` | Dispatches 4 fix strategies per root cause with budget accounting | P20 |
-| `synthesizer` | Composes final answer with `[doc_id p.N]` citations; streaming token output | P1 + P16 |
-| `grounding` | Post-hoc audit: citation authenticity + numeric consistency; strips unverified claims | P23 |
+| Node | Role |
+|---|---|
+| `query_router` | Keyword heuristic + ~80 token LLM decide retrieval vs direct answer; conditional edge routes accordingly |
+| `retrieval_scout` | Pre-retrieves top-3 candidate docs with relevance scores; gives planner informed context |
+| `planner` | Two-stage: `query_class` localization → variant prompt + few-shot → ordered DAG plan with `task_id`, `depends_on`, `$tN.value` placeholders |
+| `executor` | DAG topological scheduling + ThreadPool concurrency; resolves `$tN.value` placeholders → calculator; Tool Registry dispatch; VLM reads |
+| `plan_critic` | On-demand plan revision triggered by signal words or failed todos; re-entry protection via `plan_critic_last_cursor` + `plan_critic_iter` cap (max 2) |
+| `verifier` | Structured `MissingFact[]` with 4 root-cause types; numeric/comparative queries: 3-instance parallel voting (strict/base/numeric) |
+| `remediation` | Root-cause dispatch → explicit tool_calls (not string-prefix hacks); 3-budget protection (iter=3 / retrieval=10 / vlm=20) |
+| `synthesizer` | Composes final answer with `[doc p.N]` citations; streaming token output; regex-parses citations → strips fabricated refs against evidence set |
 
 ### 2.4 Four Retriever Configurations
 
@@ -165,9 +186,13 @@ Any Qdrant exception automatically fallbacks to `_in_memory_retrieve` — the ag
 
 ### 3.1 Why LangGraph over LangChain AgentExecutor?
 
-LangChain's AgentExecutor is a black-box loop. LangGraph gives us an explicit state machine — every node's I/O is observable, reflexion loops are controlled via conditional edges, and the entire topology is 20 lines of assembly code in `graph.py`.
+LangChain's AgentExecutor is a black-box loop. LangGraph gives us an explicit state machine — every node's I/O is observable, reflexion loops are controlled via conditional edges, and the entire topology is ~30 lines of assembly code in `graph.py`.
 
-### 3.2 Why ColQwen2 for Visual Retrieval?
+### 3.2 Why Not ReAct?
+
+Financial QA is structured (entity × period × metric). ReAct's serial think-act-observe loop loses parallelism in cross-company comparisons, burns tokens, and kills observability. A decomposition-then-execute DAG with typed node outputs is a better fit.
+
+### 3.3 Why ColQwen2 for Visual Retrieval?
 
 Traditional RAG: `PDF → OCR → text chunks → single-vector embedding → semantic search`. In financial documents, OCR error rates on dense tables are high, and single-vector compression loses spatial layout.
 
@@ -179,24 +204,32 @@ score(q, d) = Σ_{i ∈ q_tokens} max_{j ∈ d_tokens} ⟨q_i, d_j⟩
 
 This preserves table structure, chart layouts, and number positions that OCR/text-chunking destroys. ViDoRe benchmark: nDCG@5 ~89% (ColPali ~81%). The 2B base model fits on an RTX 3060 6GB in bf16.
 
-### 3.3 Why Qdrant?
+### 3.4 Why Qdrant?
 
 Standard vector DBs (Chroma, Pinecone, pgvector) only support single-vector-per-document. A 200-page annual report produces ~200K vectors — Qdrant 1.10+ is one of the few databases with native `MultiVectorConfig(comparator=MAX_SIM)` support. We use `Distance.DOT` (not COSINE) to match Python's einsum dot-product behavior exactly.
 
-### 3.4 Structured Reflexion (P19–P20)
+### 3.5 Query Routing
+
+Not all queries need retrieval. "Hello" / "What can you do?" / follow-up questions answerable from chat history should skip the entire retrieval+plan+execute pipeline. `query_router` uses keyword heuristics for strong signals (e.g., "2023年营收" → retrieve; "你好" → direct), falling back to a ~80 token LLM call for ambiguous queries. This avoids wasting retrieval+VLM budget on casual turns.
+
+### 3.6 LLMCompiler-Style DAG Execution
+
+Planner outputs a DAG plan — each subtask has a `task_id` and `depends_on` list. Cross-task data flows through `$tN.value` placeholders: earlier tasks' computed values are substituted before downstream tasks invoke the calculator. The executor does topological scheduling with same-layer ThreadPool concurrency. Synthesizer prompt enforces a hard rule: "if a `compute:` line exists, use its value — no recalculation."
+
+### 3.7 Structured Reflexion
 
 Instead of a fuzzy "need more info" string, the verifier outputs structured `MissingFact` entries, each with a `root_cause` enum:
 
 | root_cause | Fix Strategy |
 |---|---|
 | `retrieval_miss` | Widen `top_k`, re-retrieve with rewritten query |
-| `reading_miss` | Refine VLM instruction, re-read same pages (no re-retrieval) |
+| `reading_miss` | Construct explicit `read_page_with_vlm` tool_calls for the same pages |
 | `ambiguous_query` | Rewrite to fully self-contained query |
-| `inconsistency` | Trigger `disambiguate_caliber` to extract reporting caliber from each page |
+| `inconsistency` | Trigger `disambiguate_caliber` with conflicting fact texts |
 
 Three layers of protection against infinite loops: `max_reflexion_iter=3` + `budget_retrievals=10` + `budget_vlm_calls=20`.
 
-### 3.5 Tool Registry (P21)
+### 3.8 Tool Registry
 
 Tools self-describe via `(name, description, params_schema, output_schema)`. The planner prompt auto-discovers available tools. The executor does pure dispatch + output validation. Adding a new tool requires one `register(ToolSpec(...))` call — no changes to planner, executor, or schemas.
 
@@ -204,19 +237,20 @@ Tools self-describe via `(name, description, params_schema, output_schema)`. The
 |---|---|---|
 | `retrieve_pages` | retrieval | ColQwen2 multi-vector MaxSim search |
 | `read_page_with_vlm` | reading | VLM page image → structured text |
-| `calculate` | compute | AST-bounded safe numeric evaluation |
+| `calculate` | compute | AST-bounded safe numeric evaluation with `$tN.value` resolution |
 | `disambiguate_caliber` | resolution | Cross-page number conflict → VLM caliber extraction |
 
-### 3.6 Grounding Audit (P23)
+### 3.9 Citation Verification
 
-Post-synthesis, pure-rule checks (regex + set lookups, zero LLM calls):
-- **Citation check:** Every `[doc_id p.N]` in the answer must exist in `extracted_facts`
-- **Numeric check:** Every number+unit pair must fuzzy-match a fact value (±0.1%)
-- **Confidence banner:** ⚠ partial mismatch / 🛑 severe mismatch
+Post-synthesis, pure-rule checks (regex + set lookups, zero LLM calls): citations are parsed from answer text via `[doc p.N]` pattern matching, then checked against the `extracted_facts` evidence set. Fabricated references are stripped. Only pages actually cited are returned to the frontend.
 
-### 3.7 Cross-Turn Fact Memory (P24–P25)
+### 3.10 Cross-Turn Fact Memory (Three-Layer)
 
-After each VLM read, `fact_extractor` (pure regex, zero LLM) extracts `(entity, period, metric, value, unit)` from Chinese financial text. Facts are persisted to SQLite per conversation. On follow-up questions, the executor checks `known_facts` first — if `(茅台, 2023, 营收)` is already known, skip retrieval+VLM entirely. Expected 40–60% reduction in retrieval calls for multi-turn sessions.
+- **Working memory**: `fact_index` dict `{(entity, period, metric): Fact}` — lives within a single query
+- **Episodic memory**: SQLite `conv_facts` table + ColQwen text encoder 128d float16 embeddings — persists across conversation turns; `known_facts` checked before retrieval+VLM
+- **Semantic memory**: facts with `hit_count ≥ 3` and `grounding_verified=1` are promoted to `global_facts` for cross-conversation reuse
+
+On follow-up questions, the executor checks `known_facts` first — if `(茅台, 2023, 营收)` is already known, skip retrieval+VLM entirely. Expected 40–60% reduction in retrieval calls for multi-turn sessions.
 
 ---
 
@@ -224,46 +258,56 @@ After each VLM read, `fact_extractor` (pure regex, zero LLM) extracts `(entity, 
 
 ```
 findoc-agent/
-├── agent/                       # Agent core — 7-node LangGraph state machine
-│   ├── graph.py                 # build_graph() / compile_graph()
-│   ├── state.py                 # AgentState TypedDict + Fact / SubTask / PageHit
-│   ├── schemas.py               # LLM structured output schemas (PlannerOutput, VerifierOutput)
-│   ├── config.py                # config.yaml + env loader
-│   ├── llm.py                   # ChatOpenAI factory (DeepSeek API)
-│   ├── prompts/                 # Node prompt templates (.txt)
-│   └── nodes/                   # 7 node implementations
-│       ├── planner.py           #   retrieval_scout + planner (P22)
-│       ├── executor.py          #   tool dispatch + VLM read + fact extraction (P21/P24/P25)
-│       ├── verifier.py          #   sufficiency + consistency + structured missing_facts (P19)
-│       ├── remediation.py       #   root-cause dispatch → 4 fix strategies (P20)
-│       ├── synthesizer.py       #   cited answer + streaming token output (P16)
-│       └── grounding.py         #   citation + numeric post-hoc audit (P23)
+├── agent/                       # Agent core — 8-node LangGraph state machine
+│   ├── graph.py                 #   build_graph() — 30-line topology with conditional edges
+│   ├── state.py                 #   AgentState TypedDict + Fact / SubTask / PageHit / Citation
+│   ├── schemas.py               #   LLM structured output schemas (PlannerOutput, VerifierOutput)
+│   ├── config.py                #   config.yaml + env loader
+│   ├── llm.py                   #   ChatOpenAI factory (DeepSeek API)
+│   ├── compression.py           #   TokenBudget-aware context summarization
+│   ├── memory.py                #   Three-layer memory: Working / Episodic / Semantic
+│   ├── retry.py                 #   Tenacity exponential backoff + transient/fatal classification
+│   ├── prompts/                 #   Node prompt templates (.txt) + few-shot examples (.jsonl)
+│   └── nodes/                   #   8 node implementations
+│       ├── query_router.py      #     Keyword heuristic + LLM fallback → route retrieval vs direct
+│       ├── planner.py           #     retrieval_scout + planner (two-stage with query_class)
+│       ├── executor.py          #     DAG scheduling + $tN.value resolution + tool dispatch + fact extraction
+│       ├── plan_critic.py       #     On-demand plan revision (signal-word / failed-todo trigger)
+│       ├── verifier.py          #     Structured MissingFact + 3-instance parallel voting
+│       ├── remediation.py       #     Root-cause dispatch → explicit tool_calls + budget accounting
+│       └── synthesizer.py       #     Cited answer + streaming + citation regex parsing
 ├── tools/                       # Tool layer — registry + 4 built-in tools
-│   ├── registry.py              #   ToolSpec / REGISTRY / dispatch() (P21)
-│   ├── colpali_tool.py          #   ColQwen2 retrieval (in-memory / Qdrant / remote)
-│   ├── vlm_tool.py              #   VLM page reading (OpenAI-compat) + SQLite cache
-│   ├── calculator.py            #   AST-bounded safe expression evaluator
-│   ├── fact_extractor.py        #   Regex-based structured fact extraction (P24)
-│   ├── disambiguate.py          #   Caliber disambiguation tool (P20)
-│   └── vlm_cache.py             #   (image_path, instruction) → cached VLM output
+│   ├── registry.py              #     ToolSpec / REGISTRY / dispatch()
+│   ├── colpali_tool.py          #     ColQwen2 retrieval (in-memory / Qdrant / remote)
+│   ├── vlm_tool.py              #     VLM page reading (OpenAI-compat) + SQLite cache
+│   ├── calculator.py            #     AST-bounded safe expression evaluator
+│   ├── fact_extractor.py        #     Regex-based structured fact extraction
+│   ├── disambiguate.py          #     Caliber disambiguation tool
+│   └── vlm_cache.py             #     (image_path, instruction) → cached VLM output
+├── skills/                      # Skill system — reusable Tool+Prompt+Strategy units
+│   ├── registry.py              #     YAML skill loader + trigger-keyword matching
+│   ├── single_fact.yaml         #     Single-fact query skill profile
+│   ├── multi_step_calc.yaml     #     Multi-step calculation skill profile
+│   ├── cross_doc_compare.yaml   #     Cross-document comparison skill profile
+│   └── trend_analysis.yaml      #     Trend analysis skill profile
 ├── ingestion/                   # Offline data pipeline
-│   ├── pdf_to_pages.py          #   PDF → page PNGs
-│   ├── build_index.py           #   ColQwen2 encode → .pt multi-vector index
-│   ├── model_loader.py          #   Shared ColQwen2 model loading + encode logic
-│   ├── push_to_qdrant.py        #   .pt → Qdrant upsert (idempotent)
-│   └── upload.py                #   User upload pipeline (save → convert → encode → index)
+│   ├── pdf_to_pages.py          #     PDF → page PNGs
+│   ├── build_index.py           #     ColQwen2 encode → .pt multi-vector index
+│   ├── model_loader.py          #     Shared ColQwen2 model loading + encode logic
+│   ├── push_to_qdrant.py        #     .pt → Qdrant upsert (idempotent)
+│   └── upload.py                #     User upload pipeline (save → convert → encode → index)
 ├── services/                    # Model serving
-│   └── colqwen_server.py        #   Litserve ColQwen2 GPU service
+│   └── colqwen_server.py        #     Litserve ColQwen2 GPU service
 ├── backend/                     # FastAPI backend
-│   ├── server.py                #   POST /query SSE + CRUD + upload + conv_facts (P25)
-│   ├── storage.py               #   SQLite (conversations / messages / documents / conv_facts)
-│   └── schemas.py               #   API request/response models
+│   ├── server.py                #     POST /query SSE + CRUD + upload + conv_facts
+│   ├── storage.py               #     SQLite (conversations / messages / documents / conv_facts)
+│   └── schemas.py               #     API request/response models
 ├── app/                         # Frontend
-│   ├── chainlit_app.py          #   Chainlit UI (SSE consumer + Step renderer)
-│   └── data_layer.py            #   Chainlit DataLayer → backend SQLite
+│   ├── chainlit_app.py          #     Chainlit UI (SSE consumer + Step renderer + TodoList)
+│   └── data_layer.py            #     Chainlit DataLayer → backend SQLite
 ├── eval/                        # Evaluation
-│   ├── qa_dataset.jsonl         #   QA pairs (30 planned, currently sample)
-│   └── run_eval.py              #   Evaluation runner
+│   ├── queries.yaml             #     QA pairs (3 questions, target 30)
+│   └── run_eval.py              #     Evaluation runner
 ├── config.yaml                  # Global config (model / retriever / services)
 ├── docker-compose.yml           # Qdrant container
 └── requirements.txt
@@ -345,6 +389,7 @@ agent:
 | **Model serving** | Litserve | vLLM does not support multi-vector encoders; Litserve is Python-native with GPU batching |
 | **Backend** | FastAPI + SSE | Unidirectional streaming — no need for WebSocket overhead |
 | **Frontend** | Chainlit | Python-native, LangGraph first-class citizen, zero changes to agent/tools/ingestion |
+| **Error recovery** | Tenacity | Exponential backoff; transient retry vs fatal immediate-fail distinction |
 
 ---
 
@@ -353,19 +398,19 @@ agent:
 | Phase | Status | Description |
 |---|---|---|
 | P1–P4 | ✅ | Skeleton: directory layout, AgentState, LangGraph assembly, node/tool stubs, CLI smoke test |
-| P5–P6 | ⏳ | Chainlit frontend + eval dataset (30 QA pairs) |
+| P5–P6 | ⏳ | Chainlit frontend + eval dataset (30 QA pairs — currently 3 questions) |
 | P7–P10 | ✅ | ColQwen2 Litserve, Qdrant multi-vector, SSE progress streaming |
 | P11–P18 | ✅ | VLM concurrency, VLM cache, conversation history, document upload, streaming output, auto-title, knowledge base panel |
 | P19–P25 | ✅ | Structured verifier, differentiated remediation, Tool Registry, retrieval-scout planner, grounding audit, structured fact extraction, cross-turn memory |
-| **P26** | ⏳ | **Error recovery:** full-chain retry + timeout + error_log |
-| **P27** | ⏳ | **Context compression:** structured summarization over truncation |
-| **P28** | ⏳ | **Memory upgrade:** semantic matching + 3-layer architecture (Working/Episodic/Semantic) |
-| **P29** | ⏳ | **Task system:** DAG-based concurrent execution + plan_critic |
-| **P30** | ⏳ | **Dynamic prompts:** query_class-driven prompt variants + few-shot injection |
-| **P31** | ⏳ | **Multi-agent:** parallel verification + Supervisor/Specialist routing |
-| **P32** | ⏳ | **Skill system:** reusable Tool+Prompt+Strategy capability units |
+| **P26** | ✅ | **Error recovery:** full-chain retry + timeout + structured `error_log` |
+| **P27** | ✅ | **Context compression:** structured summarization + TokenBudget management |
+| **P28** | ✅ | **Memory upgrade:** three-layer architecture (Working/Episodic/Semantic) + cosine semantic matching |
+| **P29** | ✅ | **DAG execution:** LLMCompiler-style `$tN.value` data flow + plan_critic on-demand revision |
+| **P30** | ✅ | **Dynamic prompts:** query_class-driven prompt variants + few-shot injection (3 DAG examples) |
+| **P31** | ✅ | **Multi-agent:** 3-instance parallel verification (strict/base/numeric majority vote) |
+| **P32** | ✅ | **Skill system:** YAML-based Tool+Prompt+Strategy capability units with trigger-keyword matching |
 
-See [DEVLOG.md](./DEVLOG.md) for detailed engineering decisions and [LEARNLOG.MD](./LEARNLOG.MD) for core concepts deep-dive.
+See [DEVLOG.md](./DEVLOG.md) for detailed engineering decisions and change logs, and [LEARNLOG.MD](./LEARNLOG.MD) for core concepts deep-dive.
 
 ---
 
@@ -373,6 +418,7 @@ See [DEVLOG.md](./DEVLOG.md) for detailed engineering decisions and [LEARNLOG.MD
 
 - **ColPali:** Faysse et al., *Efficient Document Retrieval with Vision Language Models*, 2024
 - **ColQwen2:** *Exploring Visual Language Models for Document Retrieval*, 2025 — [vidore/colqwen2-v0.1](https://huggingface.co/vidore/colqwen2-v0.1)
+- **LLMCompiler:** Kim et al., *An LLM Compiler for Parallel Function Calling*, ICML 2024
 - **Reflexion:** Shinn et al., *Reflexion: Language Agents with Verbal Reinforcement Learning*, NeurIPS 2023
 - **MaxSim (Late Interaction):** Khattab & Zaharia, *ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT*, SIGIR 2020
 - **LangGraph:** [langchain-ai.github.io/langgraph](https://langchain-ai.github.io/langgraph/)

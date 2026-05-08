@@ -1,6 +1,6 @@
 # FinDoc Agent
 
-> 面向视觉密集型金融文档（年报、招股书、研报）的多模态 RAG Agent。基于 **ColQwen2** 视觉检索 + **LangGraph** 7 节点状态机，具备结构化根因诊断、差异化反射修复、后置引用/数值审计和跨轮事实复用能力。
+> 面向视觉密集型金融文档（年报、招股书、研报）的多模态 RAG Agent。基于 **ColQwen2** 视觉检索 + **LangGraph** 8 节点状态机，具备结构化根因诊断、LLMCompiler 风格 DAG 执行、三层语义记忆和跨轮事实复用能力。
 
 [![Python](https://img.shields.io/badge/python-3.10+-3776AB?logo=python)](https://www.python.org/)
 [![LangGraph](https://img.shields.io/badge/orchestration-LangGraph-1c3c3c)](https://langchain-ai.github.io/langgraph/)
@@ -41,81 +41,101 @@
 **用视觉检索绕过 OCR，用 Agent 状态机编排多步推理。**
 
 - **ColQwen2** 直接以**页面图像**为检索单位，多向量 + MaxSim 后期交互，完整保留表格结构、图表布局、数字格式——这些是 OCR 会破坏的信息。
-- **Agent 层**负责任务分解、工具调度、根因诊断、差异化修复、后置引用/数值审计——把"召回的页面"转化为"带引用且经过校验的结构化回答"。
+- **Agent 层**负责查询路由、任务分解为 DAG 计划、LLMCompiler 风格跨任务数据流、工具调度、根因诊断、差异化修复、引用/数值审计——把"召回的页面"转化为"带引用且经过校验的结构化回答"。
 
-### 当前能力（P25 阶段）
+### 当前能力
 
 | 能力 | 说明 |
 |---|---|
+| **查询路由** | 关键词启发式 + 轻量 LLM（~80 token）判断是否启用检索或直接作答 |
 | **多文档问答** | 跨 14+ 已索引年报自动路由查询 |
 | **跨公司对比** | 支持口径消歧的跨公司指标对比 |
-| **数值计算** | AST 安全表达式求值（如 `(1505.6 + 1420.3) / 2`） |
+| **数值计算** | AST 安全表达式求值 + `$task_id.value` 跨任务数据流（LLMCompiler 风格） |
 | **结构化反射** | 四类根因诊断：检索遗漏 / 阅读遗漏 / 查询歧义 / 跨页不一致 |
-| **后置审计** | 引用真实性校验 + 数值模糊匹配（±0.1%）；未验证项剥离 + 置信度标识 |
-| **跨轮记忆** | 结构化事实 (实体, 期间, 指标, 数值, 单位) 跨对话轮次复用；追问跳过检索 |
+| **引用校验** | 从答案文本正则解析 `[doc p.N]` 引用，对比 evidence 集合剥离虚构引用 |
+| **跨轮记忆** | 三层架构：工作 dict → 情景 SQLite → 语义全局；cosine ≥ 0.85 硬命中跳过检索 |
 | **流式输出** | Synthesizer token-by-token SSE 实时推送 |
 | **用户上传文档** | PDF/图片上传 → 自动编码 → Qdrant 索引 → 立即可查询 |
 | **知识库管理** | 面板 UI：列表 / 删除 / 重新索引 / 封面预览 |
+| **错误恢复** | Tenacity 指数退避，区分瞬时/致命错误，结构化 `error_log` |
 
 ---
 
 ## 2. 系统架构
 
-### 2.1 Agent 工作流（7 节点状态机）
+### 2.1 Agent 工作流（8 节点状态机）
 
 ```
 用户问题
     │
     ▼
-┌──────────────────┐  全库 MaxSim 预检索 → top-3 候选文档 + 相关性分数
-│ retrieval_scout  │  (P22)
+┌──────────────────┐  关键词启发式 + LLM 兜底（~80 token）
+│  query_router    │  判断：是否需要文档检索？
 └────────┬─────────┘
          │
-         ▼
-┌──────────┐         分解问题 → 有序 SubTask 列表
-│ Planner  │  ──►    每个 SubTask: sub_query / target_doc / tool_calls / query_class
-└──────────┘         输入含 candidate_docs + 可用工具列表
-    │
-    ▼
-┌──────────┐         tool_calls → registry dispatch (P21)
-│ Executor │  ──►    回退 expected_output_schema 旧路径
-└──────────┘         VLM 输出 → fact_extractor 结构化 (P24)
-    │                检索前先查 known_facts 跨轮缓存 (P25)
-    ▼
-┌──────────┐         结构化 missing_facts（含 root_cause + confidence）
-│ Verifier │  ──►    早停：无新事实 → 强制 synthesizer (P19)
-└──────────┘
-    │
-    ├─ 充分 ────────────────────────┐
-    │                                ▼
-    ├─ 不充分 ──► ┌──────────┐  按根因分派 4 条修复路径 (P20):
-    │             │Remediation│  retrieval_miss → 放宽 top_k 重检索
-    │             └─────┬─────┘  reading_miss → 精炼指令重读同批页
-    │                   │        ambiguous_query → 改写自包含查询
-    │                   ▼        inconsistency → 口径消歧
-    │               Executor     budget 耗尽 → 强制 fallthrough
-    │                   │
-    └───────────────────┘
-                        ▼
-                 ┌─────────────┐
-                 │ Synthesizer │  汇总事实 → [doc_id p.X] 引用答案 (流式)
-                 └──────┬──────┘
-                        ▼
-                 ┌─────────────┐  引用反向校验 + 数值模糊匹配
-                 │  Grounding  │  剥离未验证引用 + 置信度 banner (P23)
-                 └─────────────┘
+   ┌─────┴─────┐
+   │ 需要     │
+   │ 检索？    │
+   └─────┬─────┘
+   不需要 │      需要
+         ▼         ▼
+┌─────────────┐  ┌──────────────────┐  全库 MaxSim → top-3 候选文档
+│ synthesizer │  │ retrieval_scout  │  （为 planner 提供候选文档上下文）
+│  (直接作答)  │  └────────┬─────────┘
+└──────┬──────┘           │
+       │                  ▼
+       │         ┌──────────┐         query_class 分类 → 变体 prompt
+       │         │ planner  │  ──►    + few-shot → 有序 DAG plan（含 task_id
+       │         └────┬─────┘         和 `$tN.value` 跨任务占位符）
+       │              │
+       │              ▼
+       │         ┌──────────┐         DAG 拓扑排序 → ThreadPool 分层并发；
+       │         │ executor │  ──►    `$tN.value` 占位符解析 → calculator；
+       │         └────┬─────┘         Tool Registry 调度；VLM 读取 + fact_extractor
+       │              │
+       │              ▼
+       │    ┌────────────────────┐
+       │    │ 触发 plan_critic?  │  信号词或 failed todo → plan_critic
+       │    │                    │  按需修订 plan（重入保护：cursor + iter 上限）
+       │    └──┬──────────┬──────┘
+       │   否  │          │ 是
+       │       ▼          ▼
+       │  ┌──────────┐  ┌─────────────┐  修订 plan → 回到 executor
+       │  │ verifier │  │ plan_critic │  （最多修订 2 次）
+       │  └────┬─────┘  └──────┬──────┘
+       │       │                │
+       │       │                └──→ executor
+       │       ├─ 充分 ─────────────────────┐
+       │       │                             ▼
+       │       ├─ 不充分 ──► ┌──────────┐  根因分派 → 显式 tool_calls
+       │       │            │remediation│  (read_page_with_vlm / disambiguate_caliber)
+       │       │            └─────┬─────┘  预算扣减；耗尽 → 强制 fallthrough
+       │       │                  │
+       │       │                  ▼
+       │       └─────────────→ executor
+       │                              │
+       └──────────────────────────────┘
+                                      ▼
+                             ┌─────────────┐
+                             │ synthesizer │  汇总事实 → 引用答案（SSE 流式输出）
+                             └──────┬──────┘  从输出文本正则解析 `[doc p.N]`；
+                                    │         对比 evidence 剥离虚构引用
+                                    ▼
+                                   END
 ```
+
+**8 个节点：** 7 个常驻（query_router、retrieval_scout、planner、executor、verifier、remediation、synthesizer）+ 1 个按需触发（plan_critic）。
 
 ### 2.2 部署架构
 
 ```
 ┌─ uvicorn backend.server:app (port 8001) ──────┐
 │  FastAPI + SSE                                  │
-│  POST /api/v1/query     → SSE 流（7 节点进度） │
+│  POST /api/v1/query     → SSE 流（8 节点进度） │
 │  GET  /api/v1/documents → 已索引文档列表        │
 │  GET  /api/v1/health                            │
 │  startup → 预加载 ColQwen2 + 索引               │
-│  per-query → load/save conv_facts (P25)         │
+│  per-query → load/save conv_facts               │
 └──────────────────┬──────────────────────────────┘
                    │
         ┌──────────┴────────────┐
@@ -129,8 +149,8 @@
 
 ┌─ chainlit run app/chainlit_app.py ────────────┐
 │  纯 UI 层（仅 import chainlit / httpx）         │
-│  消费 SSE：event=node|status|token|done        │
-│  动态 Step + 引用 inline Image + 置信度 banner │
+│  消费 SSE：event=status|token|node|todo        │
+│  动态 Step + 引用 inline Image + TodoList      │
 └────────────────────────────────────────────────┘
 ```
 
@@ -138,15 +158,16 @@
 
 ### 2.3 节点职责
 
-| 节点 | 职责 | 新增于 |
-|---|---|---|
-| `retrieval_scout` | 预检索全库，返回 top-3 候选文档 + 相关性分数，让 planner 做知情决策 | P22 |
-| `planner` | 分解 `question → [SubTask...]`，含 `tool_calls` / `target_doc` / `query_class` | P1 |
-| `executor` | tool_calls 优先走 registry dispatch；回退旧版 schema 路由；VLM 并发读取 | P1 + P21 |
-| `verifier` | 结构化 sufficiency + consistency 判断 → `MissingFact[]`（含 root_cause） | P1 + P19 |
-| `remediation` | 按 root_cause 分派 4 条修复策略，budget 扣减控制 | P20 |
-| `synthesizer` | 汇总事实 → 带 `[doc_id p.N]` 引用答案，流式 token 输出 | P1 + P16 |
-| `grounding` | 后置审计：逐条校验引用真实性 + 数值与 evidence 一致性，剥离未验证项 | P23 |
+| 节点 | 职责 |
+|---|---|
+| `query_router` | 关键词启发式 + ~80 token LLM 判定是否检索；图条件边据此路由检索 vs 直答 |
+| `retrieval_scout` | 预检索全库，返回 top-3 候选文档 + 相关性分数，让 planner 做知情决策 |
+| `planner` | 两段式：query_class 分类 → 变体 prompt + few-shot → 有序 DAG plan（含 `task_id`、`depends_on`、`$tN.value` 占位符） |
+| `executor` | DAG 拓扑调度 + ThreadPool 同层并发；`$tN.value` 占位符解析 → calculator；Tool Registry 调度；VLM 读取 |
+| `plan_critic` | 信号词或 failed todo 触发的按需 plan 修订；重入保护 `plan_critic_last_cursor` + `plan_critic_iter`（上限 2） |
+| `verifier` | 结构化 `MissingFact[]`（含 4 类根因）；数值/对比类查询启用 3 实例并行投票（strict/base/numeric） |
+| `remediation` | 根因分派 → 显式 tool_calls（非字符串前缀 hack）；三重预算保护（iter=3 / retrieval=10 / vlm=20） |
+| `synthesizer` | 汇总事实 → `[doc p.N]` 格式引用答案（SSE 流式）；正则解析引用 → 对比 evidence 集合剥离虚构项 |
 
 ### 2.4 四种检索部署组合
 
@@ -165,9 +186,13 @@
 
 ### 3.1 为什么选 LangGraph 而非 LangChain AgentExecutor？
 
-LangChain 的 AgentExecutor 是黑箱循环。LangGraph 是显式状态机——每个节点的 I/O 可观测，reflexion 循环通过条件边控制，整个拓扑在 `graph.py` 里仅 20 行装配代码。
+LangChain 的 AgentExecutor 是黑箱循环。LangGraph 是显式状态机——每个节点的 I/O 可观测，reflexion 循环通过条件边控制，整个拓扑在 `graph.py` 里仅 ~30 行装配代码。
 
-### 3.2 为什么用 ColQwen2 做视觉检索？
+### 3.2 为什么不用 ReAct？
+
+金融 QA 是结构化任务（实体 × 周期 × 指标）。ReAct 的串行 think-act-observe 循环在跨公司对比时丢失并发、烧 token、丢了可观测性。"分解-执行"DAG + 带类型标注的节点产出是更适合的范式。
+
+### 3.3 为什么用 ColQwen2 做视觉检索？
 
 传统 RAG：`PDF → OCR → 文本分块 → 单向量 embedding → 语义搜索`。金融文档表格密集，OCR 出错率高，单向量压缩丢失空间布局信息。
 
@@ -179,24 +204,32 @@ score(q, d) = Σ_{i ∈ q_tokens} max_{j ∈ d_tokens} ⟨q_i, d_j⟩
 
 表格结构、图表布局、数字位置信息完整保留。ViDoRe benchmark：nDCG@5 ~89%（ColPali ~81%）。2B 基座在 RTX 3060 6GB bf16 推理不会 OOM。
 
-### 3.3 为什么必须用 Qdrant？
+### 3.4 为什么必须用 Qdrant？
 
 标准向量库（Chroma、Pinecone、pgvector）只支持单向量存一条记录。一份 200 页年报产生约 20 万个向量——Qdrant 1.10+ 是少数原生支持 `MultiVectorConfig(comparator=MAX_SIM)` 的数据库。使用 `Distance.DOT`（不用 COSINE）保证与 Python einsum 点积结果完全一致。
 
-### 3.4 结构化 Reflexion（P19–P20）
+### 3.5 查询路由
+
+并非所有查询都需要检索。"你好" / "你能做什么" / 基于对话历史可回答的追问——应跳过整条检索+规划+执行流水线。`query_router` 用关键词启发式识别强信号（如"2023年营收"→ 检索；"你好"→ 直答），模糊情况走 ~80 token LLM 判断。避免在闲聊轮次浪费检索+VLM 预算。
+
+### 3.6 LLMCompiler 风格 DAG 执行
+
+Planner 产出 DAG plan——每个 subtask 有 `task_id` 和 `depends_on` 列表。跨任务数据通过 `$tN.value` 占位符流转：下游任务调用 calculator 前，先用前置任务的输出替换占位符。Executor 做拓扑排序 + 同层 ThreadPool 并发。Synthesizer prompt 有硬约束："有 `compute:` 行就必须用其 value，禁止重算"。
+
+### 3.7 结构化 Reflexion
 
 Verifier 不再输出模糊的"还需要更多信息"字符串，而是结构化的 `MissingFact` 列表，每条带 `root_cause` 枚举：
 
 | root_cause | 修复策略 |
 |---|---|
 | `retrieval_miss` | 放宽 `top_k`，用改写后的 query 重检索 |
-| `reading_miss` | 精炼 VLM instruction，重读同一批页（不走 ColQwen） |
+| `reading_miss` | 构造显式 `read_page_with_vlm` tool_calls 重读同批页 |
 | `ambiguous_query` | 改写为完全自包含的查询 |
-| `inconsistency` | 触发 `disambiguate_caliber` 对冲突页逐页提取披露口径 |
+| `inconsistency` | 触发 `disambiguate_caliber`，传入冲突事实文本 |
 
 三重防死循环保护：`max_reflexion_iter=3` + `budget_retrievals=10` + `budget_vlm_calls=20`。
 
-### 3.5 Tool Registry（P21）
+### 3.8 Tool Registry
 
 工具自描述 `(name, description, params_schema, output_schema)`，planner prompt 自动感知可用工具，executor 纯 dispatch + 输出校验。加新工具只需一行 `register(ToolSpec(...))`——无需改 planner、executor 或 schemas。
 
@@ -204,19 +237,20 @@ Verifier 不再输出模糊的"还需要更多信息"字符串，而是结构化
 |---|---|---|
 | `retrieve_pages` | retrieval | ColQwen2 多向量 MaxSim 检索 |
 | `read_page_with_vlm` | reading | VLM 页面图 → 结构化文本 |
-| `calculate` | compute | AST 受限安全数值求值 |
+| `calculate` | compute | AST 受限安全数值求值（支持 `$tN.value` 解析） |
 | `disambiguate_caliber` | resolution | 跨页数值冲突 → VLM 口径提取 |
 
-### 3.6 Grounding 后置审计（P23）
+### 3.9 引用校验
 
-Synthesizer 输出后，纯规则校验（正则 + 集合查，零 LLM 调用）：
-- **引用校验：** 答案中每个 `[doc_id p.N]` 必须在 `extracted_facts` 中存在
-- **数值校验：** 每个数值+单位必须与 evidence 模糊匹配（±0.1%）
-- **置信度 banner：** 全通过无标识，部分失配 ⚠，严重失配 🛑
+Synthesizer 输出后，纯规则校验（正则 + 集合查，零 LLM 调用）：从答案文本用 `[doc p.N]` 模式匹配解析引用，再与 `extracted_facts` 证据集合对比。虚构引用直接被剥离。只有模型真正引用的页才返回给前端。
 
-### 3.7 跨轮事实记忆（P24–P25）
+### 3.10 跨轮事实记忆（三层）
 
-每次 VLM 读取后，`fact_extractor`（纯 regex，零 LLM）从中文金融文本中抽取 `(实体, 期间, 指标, 数值, 单位)`。结构化 facts 落 SQLite `conv_facts` 表。下轮追问时 executor 先查 `known_facts`——若 `(茅台, 2023, 营收)` 已命中，直接跳过 retrieval+VLM。连续追问场景预期减少 40–60% 检索调用。
+- **工作记忆**：`fact_index` dict `{(实体, 期间, 指标): Fact}` — 单次查询内有效
+- **情景记忆**：SQLite `conv_facts` 表 + ColQwen 文本编码器 128d float16 向量 — 跨对话轮次复用；`known_facts` 在检索+VLM 前优先检查
+- **语义记忆**：`hit_count ≥ 3` 且 `grounding_verified=1` 的事实晋升为 `global_facts`，跨对话复用
+
+下轮追问时 executor 先查 `known_facts`——若 `(茅台, 2023, 营收)` 已命中，直接跳过 retrieval+VLM。连续追问场景预期减少 40–60% 检索调用。
 
 ---
 
@@ -224,28 +258,38 @@ Synthesizer 输出后，纯规则校验（正则 + 集合查，零 LLM 调用）
 
 ```
 findoc-agent/
-├── agent/                       # Agent 核心 — 7 节点 LangGraph 状态机
-│   ├── graph.py                 #   build_graph() / compile_graph() 图定义
-│   ├── state.py                 #   AgentState TypedDict + Fact / SubTask / PageHit
+├── agent/                       # Agent 核心 — 8 节点 LangGraph 状态机
+│   ├── graph.py                 #   build_graph() — 30 行拓扑 + 条件边
+│   ├── state.py                 #   AgentState TypedDict + Fact / SubTask / PageHit / Citation
 │   ├── schemas.py               #   LLM 结构化输出 schema（PlannerOutput, VerifierOutput）
 │   ├── config.py                #   config.yaml + env 加载
 │   ├── llm.py                   #   ChatOpenAI 工厂（DeepSeek API）
-│   ├── prompts/                 #   节点 prompt 模板（.txt）
-│   └── nodes/                   #   7 个节点实现
-│       ├── planner.py           #     retrieval_scout + planner (P22)
-│       ├── executor.py          #     tool dispatch + VLM 读取 + fact 抽取 (P21/P24/P25)
-│       ├── verifier.py          #     充分性 + 一致性 + 结构化 missing_facts (P19)
-│       ├── remediation.py       #     root_cause 分派 → 4 条修复策略 (P20)
-│       ├── synthesizer.py       #     带引用答案 + 流式 token 输出 (P16)
-│       └── grounding.py         #     引用 + 数值后置审计 (P23)
+│   ├── compression.py           #   TokenBudget 感知的上下文压缩
+│   ├── memory.py                #   三层记忆：工作 / 情景 / 语义
+│   ├── retry.py                 #   Tenacity 指数退避 + 瞬时/致命分类
+│   ├── prompts/                 #   节点 prompt 模板（.txt）+ few-shot 示例（.jsonl）
+│   └── nodes/                   #   8 个节点实现
+│       ├── query_router.py      #     关键词启发式 + LLM 兜底 → 路由检索 vs 直答
+│       ├── planner.py           #     retrieval_scout + planner（两段式 query_class）
+│       ├── executor.py          #     DAG 调度 + $tN.value 解析 + tool dispatch + fact 抽取
+│       ├── plan_critic.py       #     按需 plan 修订（信号词 / failed todo 触发）
+│       ├── verifier.py          #     结构化 MissingFact + 3 实例并行投票
+│       ├── remediation.py       #     根因分派 → 显式 tool_calls + 预算扣减
+│       └── synthesizer.py       #     引用答案 + 流式 + 正则引用解析
 ├── tools/                       # 工具层 — registry + 4 个内置工具
-│   ├── registry.py              #     ToolSpec / REGISTRY / dispatch() (P21)
+│   ├── registry.py              #     ToolSpec / REGISTRY / dispatch()
 │   ├── colpali_tool.py          #     ColQwen2 检索（in-memory / Qdrant / remote）
 │   ├── vlm_tool.py              #     VLM 页面阅读（OpenAI-compat）+ SQLite 缓存
 │   ├── calculator.py            #     AST 受限安全表达式求值器
-│   ├── fact_extractor.py        #     正则结构化 fact 抽取 (P24)
-│   ├── disambiguate.py          #     口径消歧工具 (P20)
+│   ├── fact_extractor.py        #     正则结构化 fact 抽取
+│   ├── disambiguate.py          #     口径消歧工具
 │   └── vlm_cache.py             #     (image_path, instruction) → 缓存 VLM 输出
+├── skills/                      # 技能系统 — 可复用 Tool+Prompt+Strategy 能力单元
+│   ├── registry.py              #     YAML 技能加载 + 触发关键词 O(1) 匹配
+│   ├── single_fact.yaml         #     单事实查询技能配置
+│   ├── multi_step_calc.yaml     #     多步计算技能配置
+│   ├── cross_doc_compare.yaml   #     跨文档对比技能配置
+│   └── trend_analysis.yaml      #     趋势分析技能配置
 ├── ingestion/                   # 离线数据管线
 │   ├── pdf_to_pages.py          #     PDF → 每页 PNG
 │   ├── build_index.py           #     ColQwen2 编码 → .pt 多向量索引
@@ -255,14 +299,14 @@ findoc-agent/
 ├── services/                    # 模型服务
 │   └── colqwen_server.py        #     Litserve ColQwen2 GPU 服务
 ├── backend/                     # FastAPI 后端
-│   ├── server.py                #     POST /query SSE + CRUD + upload + conv_facts (P25)
+│   ├── server.py                #     POST /query SSE + CRUD + upload + conv_facts
 │   ├── storage.py               #     SQLite（conversations / messages / documents / conv_facts）
 │   └── schemas.py               #     API 请求/响应模型
 ├── app/                         # 前端
-│   ├── chainlit_app.py          #     Chainlit UI（SSE 消费 + Step 渲染 + 置信度 banner）
+│   ├── chainlit_app.py          #     Chainlit UI（SSE 消费 + Step 渲染 + TodoList）
 │   └── data_layer.py            #     Chainlit DataLayer → 后端 SQLite
 ├── eval/                        # 评测
-│   ├── qa_dataset.jsonl         #     评测 QA 对（计划 30 题，当前示例）
+│   ├── queries.yaml             #     评测 QA 对（当前 3 题，目标 30 题）
 │   └── run_eval.py              #     评测运行脚本
 ├── config.yaml                  # 全局配置（模型 / 检索 / 服务）
 ├── docker-compose.yml           # Qdrant 容器
@@ -345,6 +389,7 @@ agent:
 | **模型服务** | Litserve | vLLM 不支持多向量 encoder；Litserve Python 原生 + GPU batching |
 | **后端** | FastAPI + SSE | 单向流式推送，无需 WebSocket 开销 |
 | **前端** | Chainlit | Python 原生，LangGraph 一等公民，agent/tools/ingestion 零修改 |
+| **错误恢复** | Tenacity | 指数退避；区分瞬时重试 vs 致命立即失败 |
 
 ---
 
@@ -353,19 +398,19 @@ agent:
 | 阶段 | 状态 | 内容 |
 |---|---|---|
 | P1–P4 | ✅ | 骨架：目录布局、AgentState、LangGraph 装配、节点/工具 stub、CLI 冒烟 |
-| P5–P6 | ⏳ | Chainlit 前端 + 评测集（30 题 QA pairs） |
+| P5–P6 | ⏳ | Chainlit 前端 + 评测集（30 题 QA pairs——当前 3 题） |
 | P7–P10 | ✅ | ColQwen2 Litserve 服务化、Qdrant 多向量、SSE 进度推送 |
 | P11–P18 | ✅ | VLM 并发、VLM 缓存、对话历史、文档上传、流式输出、自动标题、知识库面板 |
 | P19–P25 | ✅ | 结构化 Verifier、差异化修复、Tool Registry、检索感知 Planner、Grounding 审计、结构化 fact 抽取、跨轮记忆 |
-| **P26** | ⏳ | **错误恢复：** 全链路重试 + 超时 + error_log |
-| **P27** | ⏳ | **上下文压缩：** 结构化摘要替代暴力截断 + TokenBudget 管理 |
-| **P28** | ⏳ | **记忆系统升级：** 语义匹配 + 三层架构（Working/Episodic/Semantic）+ 反馈闭环 |
-| **P29** | ⏳ | **任务系统：** DAG 依赖图 + 同层并发 + plan_critic 按需修订 |
-| **P30** | ⏳ | **动态提示词：** query_class 驱动 prompt 变体 + few-shot 注入 |
-| **P31** | ⏳ | **多 Agent：** Parallel Verification 多数表决 + Supervisor/Specialist 路由 |
-| **P32** | ⏳ | **技能系统：** Tool+Prompt+Strategy 可复用能力单元 |
+| **P26** | ✅ | **错误恢复：** 全链路重试 + 超时 + 结构化 `error_log` |
+| **P27** | ✅ | **上下文压缩：** 结构化摘要 + TokenBudget 管理 |
+| **P28** | ✅ | **记忆系统升级：** 三层架构（工作/情景/语义）+ cosine 语义匹配 |
+| **P29** | ✅ | **DAG 执行：** LLMCompiler 风格 `$tN.value` 数据流 + plan_critic 按需修订 |
+| **P30** | ✅ | **动态提示词：** query_class 驱动 prompt 变体 + few-shot 注入（含 3 个 DAG 示例） |
+| **P31** | ✅ | **多 Agent：** 3 实例并行验证（strict/base/numeric 多数表决） |
+| **P32** | ✅ | **技能系统：** YAML 配置 Tool+Prompt+Strategy 能力单元 + 触发关键词匹配 |
 
-详细工程决策见 [DEVLOG.md](./DEVLOG.md)，核心概念深度解析见 [LEARNLOG.MD](./LEARNLOG.MD)。
+详细工程决策与变更日志见 [DEVLOG.md](./DEVLOG.md)，核心概念深度解析见 [LEARNLOG.MD](./LEARNLOG.MD)。
 
 ---
 
@@ -373,6 +418,7 @@ agent:
 
 - **ColPali:** Faysse et al., *Efficient Document Retrieval with Vision Language Models*, 2024
 - **ColQwen2:** *Exploring Visual Language Models for Document Retrieval*, 2025 — [vidore/colqwen2-v0.1](https://huggingface.co/vidore/colqwen2-v0.1)
+- **LLMCompiler:** Kim et al., *An LLM Compiler for Parallel Function Calling*, ICML 2024
 - **Reflexion:** Shinn et al., *Reflexion: Language Agents with Verbal Reinforcement Learning*, NeurIPS 2023
 - **MaxSim（后期交互）:** Khattab & Zaharia, *ColBERT: Efficient and Effective Passage Search via Contextualized Late Interaction over BERT*, SIGIR 2020
 - **LangGraph:** [langchain-ai.github.io/langgraph](https://langchain-ai.github.io/langgraph/)
